@@ -101,6 +101,13 @@ class TestSecrets:
     def test_value_may_contain_equals_and_dollar(self) -> None:
         set_secret("CONNECTION", "user=a$b==c")
         assert read_secrets() == {"CONNECTION": "user=a$b==c"}
+        # Stored single-quoted: Compose's env_file parser would interpolate
+        # the $ out of an unquoted (or double-quoted) value.
+        assert "CONNECTION='user=a$b==c'" in secrets_file_path().read_text()
+
+    def test_single_quotes_in_values_refused(self) -> None:
+        with pytest.raises(ValueError, match="single quotes"):
+            set_secret("KEY", "it's-bad")
 
 
 class TestStorageRegistry:

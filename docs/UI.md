@@ -51,7 +51,9 @@ step reads `os.environ["OPENAI_API_KEY"]` the same way in `app.test()` (from
 your shell) and under Airflow (from the secrets store). Semantics:
 
 - Stored in `secrets.env` in the config directory, owner-only (`0600`),
-  never inside a bundle and never committed.
+  never inside a bundle and never committed. Values are stored single-quoted
+  so Compose reads them literally (`$` survives); a value therefore cannot
+  contain single quotes or newlines.
 - The rendered compose file references the store by absolute path; values
   enter container environments at `hflow up`, so **changes apply on the next
   `hflow up`** (the tab says so). Bundles rendered before this feature gain

@@ -46,19 +46,33 @@ def user_config_dir() -> Path:
 
 
 def parse_env_text(text: str) -> dict[str, str]:
-    """Parse ``KEY=VALUE`` lines (comments and blanks skipped, values verbatim)."""
+    """Parse ``KEY=VALUE`` lines (comments and blanks skipped).
+
+    Surrounding single quotes unwrap, mirroring how Docker Compose reads the
+    same files -- the secrets store single-quotes every value so Compose
+    takes it literally (unquoted and double-quoted values undergo ``$``
+    interpolation there).
+    """
     env_values: dict[str, str] = {}
     for line in text.splitlines():
         stripped_line = line.strip()
         if not stripped_line or stripped_line.startswith("#") or "=" not in stripped_line:
             continue
         key, _, value = stripped_line.partition("=")
-        env_values[key.strip()] = value.strip()
+        value = value.strip()
+        if len(value) >= 2 and value.startswith("'") and value.endswith("'"):
+            value = value[1:-1]
+        env_values[key.strip()] = value
     return env_values
 
 
 def format_env_text(env_values: dict[str, str], *, header: str) -> str:
     return header + "".join(f"{key}={value}\n" for key, value in env_values.items())
+
+
+def _format_secrets_text(secrets: dict[str, str]) -> str:
+    # Single-quoted so Compose's env_file parser takes each value literally.
+    return _SECRETS_FILE_HEADER + "".join(f"{key}='{value}'\n" for key, value in secrets.items())
 
 
 def _write_owner_only_atomically(destination: Path, text: str) -> None:
@@ -123,14 +137,16 @@ def set_secret(name: str, value: str) -> None:
     # values that would not round-trip are refused instead of silently mangled.
     if any(character in value for character in ("\n", "\r", "\0")):
         raise ValueError(f"secret {name!r} value must not contain newlines or NUL bytes")
+    if "'" in value:
+        # Values are stored single-quoted so Compose reads them literally;
+        # the single-quote grammar has no escape.
+        raise ValueError(f"secret {name!r} value must not contain single quotes")
     if value != value.strip():
         raise ValueError(f"secret {name!r} value must not start or end with whitespace")
     ensure_secrets_file()
     secrets = read_secrets()
     secrets[name] = value
-    _write_owner_only_atomically(
-        secrets_file_path(), format_env_text(secrets, header=_SECRETS_FILE_HEADER)
-    )
+    _write_owner_only_atomically(secrets_file_path(), _format_secrets_text(secrets))
 
 
 def delete_secret(name: str) -> bool:
@@ -139,9 +155,7 @@ def delete_secret(name: str) -> bool:
     if name not in secrets:
         return False
     del secrets[name]
-    _write_owner_only_atomically(
-        secrets_file_path(), format_env_text(secrets, header=_SECRETS_FILE_HEADER)
-    )
+    _write_owner_only_atomically(secrets_file_path(), _format_secrets_text(secrets))
     return True
 
 
