@@ -55,6 +55,8 @@ PARTIAL_RUN_TIMEOUT_S = 600.0
 # The episodes carry a camera so the media stage renders a real contact sheet
 # (the pinned ffmpeg downloads once into the user-venv volume).
 PIPELINE_SOURCE = """\
+import os
+
 import hflow
 
 app = hflow.App("itest", data_root="/opt/airflow/data")
@@ -67,8 +69,19 @@ def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
 
 @app.enrich()
 def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
-    return hflow.EnrichmentResult(labels={"caption": "a robot arm moves"})
+    # secret_seen proves the user-level secrets store reached this task's
+    # container environment (via the bundle's compose env_file).
+    return hflow.EnrichmentResult(
+        labels={
+            "caption": "a robot arm moves",
+            "secret_seen": os.environ.get("HFLOW_ITEST_SECRET", "<unset>"),
+        }
+    )
 """
+
+# Deliberately shell-flavored: compose env_file handling must pass the value
+# through verbatim, not interpolate the $.
+ITEST_SECRET_VALUE = "it-works-$literally"
 
 # The relabel scenario: an UPDATED labeler. An exact repeat is a deliberate
 # no-op, while changed source or a changed observable outcome appends a new
@@ -150,7 +163,7 @@ def _run_master_to_success(
     profile: str,
     online: bool,
     timeout_s: float,
-) -> None:
+) -> str:
     triggered = client.ingest(master_dag_id, uris, profile=profile, online=online)
     final_state = _wait_for_terminal_dag_run_state(
         client, master_dag_id, triggered["dag_run_id"], timeout_s=timeout_s
@@ -159,6 +172,7 @@ def _run_master_to_success(
         f"master run {triggered['dag_run_id']} over {uris} "
         f"(profile={profile!r}, online={online}) ended {final_state!r}"
     )
+    return str(triggered["dag_run_id"])
 
 
 def _successful_run_count(client: AirflowClient, dag_id: str) -> int:
@@ -171,6 +185,61 @@ def _count(connection: Any, sql: str) -> int:
     row = connection.execute(sql).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _assert_dashboard_observes_run(
+    bundle_dir: Path, data_root: Path, client: AirflowClient, full_run_id: str
+) -> None:
+    """The UI endpoints against REAL Airflow: the flagged unknowns in one place.
+
+    Verifies (1) the Airflow 3 UI run-page route the dashboard deep-links to
+    answers 200, (2) ``order_by=-run_after`` is accepted, and (3) the trigger
+    operator's ``trigger_run_id`` XCom names a real sub-DAG run.
+    """
+    import json as json_module
+    import threading
+    import urllib.parse
+    import urllib.request
+
+    from hflow.ui import build_ui_state, create_ui_server
+
+    # (2) accepted by the real API, not just our stub
+    assert client.dag_runs("itest_pipeline_ingest", order_by="-run_after")
+
+    state = build_ui_state(bundle_dir=bundle_dir, data_root=data_root)
+    server = create_ui_server(state, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        with urllib.request.urlopen(f"{base_url}/api/pipelines/runs", timeout=30) as response:
+            runs_payload = json_module.loads(response.read())
+        (run_summary,) = [run for run in runs_payload["runs"] if run["run_id"] == full_run_id]
+        assert run_summary["stages"] == {
+            "sync": "success",
+            "meta": "success",
+            "labels": "success",
+            "media": "success",
+        }
+        assert run_summary["episode_count"] == 2
+
+        # (1) the deep link answers 200 (the Airflow UI serves its app there)
+        with urllib.request.urlopen(run_summary["airflow_url"], timeout=30) as response:
+            assert response.status == 200
+
+        # (3) sub-run linkage via the trigger operator's XCom
+        encoded_run_id = urllib.parse.quote(full_run_id, safe="")
+        with urllib.request.urlopen(
+            f"{base_url}/api/pipelines/runs/{encoded_run_id}", timeout=60
+        ) as response:
+            detail_payload = json_module.loads(response.read())
+        stages_by_name = {stage["stage"]: stage for stage in detail_payload["stages"]}
+        sync_run_id = stages_by_name["sync"]["sub_run_id"]
+        assert sync_run_id, detail_payload
+        assert client.dag_run("itest_pipeline_sync", sync_run_id).get("state") == "success"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
@@ -189,6 +258,12 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
 
     pipeline_file = tmp_path / "itest_pipeline.py"
     pipeline_file.write_text(PIPELINE_SOURCE)
+
+    # Before render/up: the store is referenced by the compose file and read
+    # at container start.
+    from hflow._user_config import set_secret
+
+    set_secret("HFLOW_ITEST_SECRET", ITEST_SECRET_VALUE)
 
     config = RuntimeConfig(
         pipeline_file=pipeline_file,
@@ -215,7 +290,7 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
         )
 
         # (a) Full profile, batch lane: master -> all four sub-DAGs succeed.
-        _run_master_to_success(
+        full_run_id = _run_master_to_success(
             client,
             master_dag_id,
             both_uris,
@@ -265,6 +340,18 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
         # The artifact file itself is on the host, under the shared data root.
         media_sheets = list((data_root / "episodes").rglob("media/*.jpg"))
         assert len(media_sheets) == 2, media_sheets
+
+        # The user-level secret reached the task container VERBATIM ($ intact).
+        connection = open_catalog_connection(data_root / "catalog")
+        try:
+            secret_values = connection.execute(
+                "SELECT DISTINCT value_text FROM measurements WHERE key = 'secret_seen'"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert secret_values == [(ITEST_SECRET_VALUE,)], secret_values
+
+        _assert_dashboard_observes_run(tmp_path / "bundle", data_root, client, full_run_id)
 
         # (b) Relabel profile over the same uris with an UPDATED labeler: only
         # the labels sub-DAG runs, the canonical files are untouched, and the
