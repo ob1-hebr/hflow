@@ -428,3 +428,45 @@ def storage_catalog_handler(
         "latest_recorded_at": latest_recorded_at,
         "measurement_keys": measurement_keys,
     }
+
+
+# ---------------------------------------------------------------------------
+# Secrets
+
+_SECRET_MASK = "•" * 8  # constant-width: the mask must not leak length
+
+
+def secrets_list_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow._user_config import read_secrets, secrets_file_path
+
+    return 200, {
+        "secrets": [
+            {"name": name, "masked_value": _SECRET_MASK} for name in sorted(read_secrets())
+        ],
+        "secrets_file": str(secrets_file_path()),
+        "wired_into_bundle": _secrets_wired(state),
+    }
+
+
+def secret_put_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow._user_config import set_secret
+
+    value = (body or {}).get("value")
+    if not isinstance(value, str) or not value:
+        return _error(400, "expected a non-empty 'value' string")
+    set_secret(match.group("name"), value)  # ValueError -> 400 upstream
+    return 204, {}
+
+
+def secret_delete_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow._user_config import delete_secret
+
+    if not delete_secret(match.group("name")):
+        return _error(404, f"no secret named {match.group('name')!r}")
+    return 204, {}

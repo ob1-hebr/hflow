@@ -25,6 +25,9 @@ from hflow.ui._handlers import (
     airflow_credentials_handler,
     run_detail_handler,
     runs_handler,
+    secret_delete_handler,
+    secret_put_handler,
+    secrets_list_handler,
     status_handler,
     storage_browse_handler,
     storage_catalog_handler,
@@ -56,6 +59,9 @@ _ROUTES: list[tuple[str, re.Pattern[str], Any]] = [
         re.compile(r"^/api/storage/roots/(?P<root_id>[0-9a-f]{8})/catalog$"),
         storage_catalog_handler,
     ),
+    ("GET", re.compile(r"^/api/secrets$"), secrets_list_handler),
+    ("PUT", re.compile(r"^/api/secrets/(?P<name>[^/]+)$"), secret_put_handler),
+    ("DELETE", re.compile(r"^/api/secrets/(?P<name>[^/]+)$"), secret_delete_handler),
 ]
 
 _ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
