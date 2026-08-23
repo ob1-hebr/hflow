@@ -46,6 +46,7 @@ Use these when you already know the outcome you need.
 - [Port existing processing and quality-check code](./PORTING.md)
 - [Call an OpenAI vision endpoint from a step](./how-to/call-openai-vision.md)
 - [Run and operate the local Airflow runtime](./RUNTIME.md)
+- [Operate pipelines from the local dashboard](./UI.md)
 - [Deploy into an existing Airflow environment](./RUNTIME.md#bring-your-own-airflow-hflow-deploy)
 - [Query quality evidence and create a manifest](./CATALOG.md)
 - [Find and reprocess stale episodes](./CATALOG.md#finding-stale-episodes-to-reprocess)
@@ -61,6 +62,7 @@ contracts.
 - [Canonical episode format](./FORMAT.md)
 - [Catalog tables and curation API](./CATALOG.md)
 - [Runtime commands and configuration](./RUNTIME.md)
+- [Dashboard tabs and the user config directory](./UI.md)
 - [Native-video provider protocol](./PROVIDERS.md)
 
 ## Explanation

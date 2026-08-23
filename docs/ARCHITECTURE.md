@@ -42,7 +42,7 @@ that is actually scheduled.
 ## Design tenets
 
 1. **Evidence, not verdicts.** Quality checks record measurements, intervals, and tags. Pass/fail policy belongs to the consumer at curation time, never hardcoded into the corpus.
-2. **Standard formats at every boundary; no new UIs.** Episodes are standard MCAP (Foxglove/Rerun open them), runs are standard Airflow DAGs (Airflow's UI shows them), the catalog and manifests are Parquet (DuckDB/pandas/anything reads them). We ship no UI and hide nothing; the system is extensible without touching our code.
+2. **Standard formats at every boundary; no proprietary data surfaces.** Episodes are standard MCAP (Foxglove/Rerun open them), runs are standard Airflow DAGs (Airflow's UI shows them), the catalog and manifests are Parquet (DuckDB/pandas/anything reads them). The dashboard (`hflow ui`) is a thin localhost viewer over those same surfaces -- Airflow's REST API and the Parquet catalog -- so nothing is hidden behind it and the system stays extensible without touching our code.
 3. **Your code stays your code.** Transformations, checks, and enrichments are plain Python functions in the user's own environment. Existing processing code plugs in through small adapters rather than being rebuilt inside a framework.
 4. **Ship code only where it earns its place.** Either the canonical format forces bridging (video lives in-band; nothing can read it without our accessors) or the code encodes a painfully-rediscoverable pitfall. We ship no client wrappers around things users already know (`openai`, `subprocess.run(["ffmpeg", ...])`); the examples are the documentation.
 5. **Coarse-grained steps.** One task processes one episode or one batch and runs for seconds to minutes. Hot loops live inside a task, never across tasks.
@@ -139,7 +139,7 @@ Airflow cannot be a normal pip dependency: its own maintainers state unconstrain
 
 **Dev loop:** `app.test(episode)` runs the entire pipeline in-process on one episode: no Docker, no scheduler, no Airflow import at all (a plain Python runner with the same gate semantics, wrapping the `app.process()` operation the DAG maps over). Iterate on a check in seconds; `app.run()` when it works.
 
-**Observability is Airflow's own UI**, exposed on localhost in Compose mode. The blog cites "the status of each step is clearly observed from the DAG" as a benefit; that UI is part of what's being democratized. The SDK adds plain-language diagnostics for embedder-specific traps (`hflow status`), it does not replace the UI.
+**Observability splits by altitude.** The dashboard (`hflow ui`, see [UI.md](./UI.md)) is the pipeline-level view: live runs, per-stage status, catalog stats. Step-level observability stays Airflow's own UI, exposed on localhost in Compose mode -- the blog cites "the status of each step is clearly observed from the DAG" as a benefit, and run rows deep-link into it. The SDK also adds plain-language diagnostics for embedder-specific traps (`hflow status`).
 
 ### Data passing
 
