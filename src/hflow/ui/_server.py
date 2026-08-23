@@ -26,6 +26,11 @@ from hflow.ui._handlers import (
     run_detail_handler,
     runs_handler,
     status_handler,
+    storage_browse_handler,
+    storage_catalog_handler,
+    storage_root_create_handler,
+    storage_root_delete_handler,
+    storage_roots_handler,
 )
 from hflow.ui._state import UiState
 
@@ -34,6 +39,23 @@ _ROUTES: list[tuple[str, re.Pattern[str], Any]] = [
     ("GET", re.compile(r"^/api/airflow-credentials$"), airflow_credentials_handler),
     ("GET", re.compile(r"^/api/pipelines/runs$"), runs_handler),
     ("GET", re.compile(r"^/api/pipelines/runs/(?P<run_id>[^/]+)$"), run_detail_handler),
+    ("GET", re.compile(r"^/api/storage/roots$"), storage_roots_handler),
+    ("POST", re.compile(r"^/api/storage/roots$"), storage_root_create_handler),
+    (
+        "DELETE",
+        re.compile(r"^/api/storage/roots/(?P<root_id>[0-9a-f]{8})$"),
+        storage_root_delete_handler,
+    ),
+    (
+        "GET",
+        re.compile(r"^/api/storage/roots/(?P<root_id>[0-9a-f]{8})/browse$"),
+        storage_browse_handler,
+    ),
+    (
+        "GET",
+        re.compile(r"^/api/storage/roots/(?P<root_id>[0-9a-f]{8})/catalog$"),
+        storage_catalog_handler,
+    ),
 ]
 
 _ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})

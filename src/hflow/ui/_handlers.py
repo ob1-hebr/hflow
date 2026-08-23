@@ -273,3 +273,158 @@ def run_detail_handler(
             }
         )
     return 200, {"run": summary, "stages": stages}
+
+
+# ---------------------------------------------------------------------------
+# Storage
+
+_BUCKET_EXTRA_HINT = 'uv add "hflow[bucket]"'
+
+
+def _root_kind(normalized_root: str) -> str:
+    return "bucket" if "://" in normalized_root else "local"
+
+
+def _all_roots(state: UiState) -> list[dict[str, Any]]:
+    """Registered roots plus the implicit local data root, deduplicated.
+
+    A root the user registered explicitly stays deletable even when it is
+    also the implicit one, so explicit entries win the dedupe.
+    """
+    from hflow._user_config import normalize_storage_root, read_storage_registry, storage_root_id
+
+    roots: list[dict[str, Any]] = [
+        {
+            "root_id": entry.root_id,
+            "root": entry.root,
+            "kind": _root_kind(entry.root),
+            "implicit": False,
+            "added_at": entry.added_at,
+        }
+        for entry in read_storage_registry()
+    ]
+    known_ids = {root["root_id"] for root in roots}
+    if state.data_root is not None:
+        implicit_root = normalize_storage_root(str(state.data_root))
+        implicit_id = storage_root_id(implicit_root)
+        if implicit_id not in known_ids:
+            roots.append(
+                {
+                    "root_id": implicit_id,
+                    "root": implicit_root,
+                    "kind": "local",
+                    "implicit": True,
+                    "added_at": None,
+                }
+            )
+    return roots
+
+
+def _resolve_root(state: UiState, root_id: str) -> dict[str, Any] | None:
+    for root in _all_roots(state):
+        if root["root_id"] == root_id:
+            return root
+    return None
+
+
+def storage_roots_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    return 200, {"roots": _all_roots(state)}
+
+
+def storage_root_create_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow._user_config import add_storage_root
+
+    root_value = (body or {}).get("root")
+    if not isinstance(root_value, str) or not root_value.strip():
+        return _error(400, "expected a non-empty 'root' string")
+    entry = add_storage_root(root_value.strip())  # ValueError -> 400 upstream
+    return 201, {
+        "root_id": entry.root_id,
+        "root": entry.root,
+        "kind": _root_kind(entry.root),
+        "implicit": False,
+        "added_at": entry.added_at,
+    }
+
+
+def storage_root_delete_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow._user_config import remove_storage_root
+
+    root_id = match.group("root_id")
+    resolved = _resolve_root(state, root_id)
+    if resolved is not None and resolved["implicit"]:
+        return _error(409, "this data root is implicit (the served --data-root); not removable")
+    if not remove_storage_root(root_id):
+        return _error(404, f"no registered data root with id {root_id!r}")
+    return 204, {}
+
+
+def storage_browse_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow.storage import parse_storage_root
+
+    resolved = _resolve_root(state, match.group("root_id"))
+    if resolved is None:
+        return _error(404, "no such data root")
+    prefix = query.get("prefix", [""])[0].strip("/")
+    try:
+        listing = parse_storage_root(resolved["root"]).list_entries(prefix)
+    except ModuleNotFoundError as error:
+        return _error(400, str(error), hint=_BUCKET_EXTRA_HINT)
+    return 200, {
+        "root_id": resolved["root_id"],
+        "prefix": prefix,
+        "directories": listing.directories,
+        "files": [{"name": name, "size": size} for name, size in listing.files],
+    }
+
+
+def storage_catalog_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    from hflow.curation import open_catalog_connection
+    from hflow.storage import parse_storage_root
+
+    resolved = _resolve_root(state, match.group("root_id"))
+    if resolved is None:
+        return _error(404, "no such data root")
+    catalog_root = parse_storage_root(resolved["root"]).child("catalog")
+    try:
+        connection = open_catalog_connection(catalog_root)
+    except FileNotFoundError:
+        return 200, {"present": False}
+    except ModuleNotFoundError as error:
+        return _error(400, str(error), hint=_BUCKET_EXTRA_HINT)
+    try:
+        episode_count, quarantined_count = connection.execute(
+            "SELECT count(*), count(*) FILTER (quarantined) FROM episodes_latest"
+        ).fetchone() or (0, 0)
+        # Formatted in SQL: fetching a TIMESTAMPTZ into Python needs pytz,
+        # which is not a dependency.
+        (latest_recorded_at,) = connection.execute(
+            "SELECT strftime(max(recorded_at) AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') "
+            "FROM episodes_raw"
+        ).fetchone() or (None,)
+        measurement_keys = [
+            key
+            for (key,) in connection.execute(
+                "SELECT DISTINCT key FROM measurements_latest ORDER BY key"
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
+    return 200, {
+        "present": True,
+        "episode_count": episode_count,
+        "ok_count": episode_count - quarantined_count,
+        "quarantined_count": quarantined_count,
+        "latest_recorded_at": latest_recorded_at,
+        "measurement_keys": measurement_keys,
+    }

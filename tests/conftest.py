@@ -23,6 +23,6 @@ if _system_ffmpeg is not None:
 def _isolated_user_config_dir(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(
-        "HFLOW_CONFIG_DIR", str(tmp_path_factory.getbasetemp() / "hflow-user-config")
-    )
+    # A FRESH directory per test: registry/secrets state must not leak between
+    # tests any more than into the developer's real ~/.config/hflow.
+    monkeypatch.setenv("HFLOW_CONFIG_DIR", str(tmp_path_factory.mktemp("hflow-user-config")))
