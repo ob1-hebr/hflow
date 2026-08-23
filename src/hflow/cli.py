@@ -1,9 +1,9 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``stale``, ``doctor``, the Compose runtime family
-``up``/``down``/``ingest``/``status``, and ``deploy`` for bring-your-own
-Airflow. Everything the CLI does is a thin call into the library: no behavior
-lives only here.
+``up``/``down``/``ingest``/``status``, ``ui`` for the local dashboard, and
+``deploy`` for bring-your-own Airflow. Everything the CLI does is a thin call
+into the library: no behavior lives only here.
 """
 
 import argparse
@@ -238,6 +238,33 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"the rendered bundle to inspect (default: {DEFAULT_BUNDLE_DIR}, else ./runtime)",
+    )
+
+    ui_parser = subparsers.add_parser(
+        "ui",
+        help="serve the local dashboard (pipelines, storage, secrets)",
+        description=(
+            "Serve the hflow dashboard on 127.0.0.1: live pipeline runs with "
+            "per-stage status and Airflow deep links, storage roots with "
+            "catalog stats and browsing, and user-level secrets for task "
+            "containers. Works without a running runtime -- tabs degrade."
+        ),
+    )
+    ui_parser.add_argument("--port", type=int, default=4400, help="port to bind (default: 4400)")
+    ui_parser.add_argument(
+        "--bundle-dir",
+        type=Path,
+        default=None,
+        help=f"the rendered bundle to observe (default: {DEFAULT_BUNDLE_DIR}, else ./runtime)",
+    )
+    ui_parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="local data root shown on the Storage tab (default: ./data)",
+    )
+    ui_parser.add_argument(
+        "--no-browser", action="store_true", help="do not open the dashboard in a browser"
     )
     return parser
 
@@ -499,6 +526,21 @@ def _command_doctor(arguments: argparse.Namespace) -> int:
     return 0 if doctor_report.conforming else 1
 
 
+def _command_ui(arguments: argparse.Namespace) -> int:
+    from hflow.ui import build_ui_state, serve_ui
+
+    state = build_ui_state(
+        bundle_dir=_resolve_bundle_dir(arguments.bundle_dir),
+        data_root=arguments.data_root,
+    )
+    if state.bundle is None:
+        print(
+            "ui: no rendered bundle found -- the Pipelines tab will suggest `hflow up`",
+            file=sys.stderr,
+        )
+    return serve_ui(state, port=arguments.port, open_browser=not arguments.no_browser)
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
     if arguments.command == "curate":
@@ -517,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_ingest(arguments)
     if arguments.command == "status":
         return _command_status(arguments)
+    if arguments.command == "ui":
+        return _command_ui(arguments)
     raise AssertionError(f"unhandled command {arguments.command!r}")
 
 
