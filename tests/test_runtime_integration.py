@@ -277,10 +277,13 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
         paths.dag_id
     )
     both_uris = ["episodes-in/episode-a.mcap", "episodes-in/episode-b.mcap"]
-    canonical_paths = [
-        data_root / "episodes" / stem / f"{stem}.canonical.mcap"
-        for stem in ("episode-a", "episode-b")
-    ]
+
+    # Episode directories are named <stem>-<source-identity hash>, so the
+    # canonical paths resolve by glob once the full run has produced them.
+    def canonical_path_for(stem: str) -> Path:
+        matches = sorted((data_root / "episodes").glob(f"{stem}-*/{stem}.canonical.mcap"))
+        assert len(matches) == 1, (stem, matches)
+        return matches[0]
 
     try:
         compose_up_detached(paths.compose_file, project_name=COMPOSE_PROJECT_NAME)
@@ -300,8 +303,7 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
         )
         for sub_dag_id in (sync_dag_id, meta_dag_id, labels_dag_id, media_dag_id):
             assert _successful_run_count(client, sub_dag_id) == 1, sub_dag_id
-        for canonical_path in canonical_paths:
-            assert canonical_path.is_file()
+        canonical_paths = [canonical_path_for(stem) for stem in ("episode-a", "episode-b")]
         canonical_mtimes = [path.stat().st_mtime_ns for path in canonical_paths]
 
         connection = open_catalog_connection(data_root / "catalog")
