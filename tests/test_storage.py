@@ -20,6 +20,7 @@ import hflow
 from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
+    StorageListing,
     fetch_uri,
     is_bucket_url,
     parse_storage_root,
@@ -416,3 +417,39 @@ class TestHardening:
         fetched = root.fetch("episodes/e/e.canonical.mcap")
         assert fetched.read_bytes() == b"v1"
         assert fetched.with_name(fetched.name + ".mirror-lock").exists()
+
+
+class TestListEntries:
+    """The shallow one-level listing both root kinds serve to the dashboard."""
+
+    def _populate(self, base: Path) -> None:
+        (base / "episodes-in" / "deep").mkdir(parents=True)
+        (base / "episodes-in" / "run_0001.mcap").write_bytes(b"x" * 5)
+        (base / "episodes-in" / "deep" / "run_0002.mcap").write_bytes(b"x" * 7)
+        (base / "top.txt").write_bytes(b"x" * 3)
+
+    def test_local_root_levels(self, tmp_path: Path) -> None:
+        self._populate(tmp_path)
+        root = LocalStorageRoot(tmp_path)
+        assert root.list_entries() == StorageListing(
+            directories=["episodes-in"], files=[("top.txt", 3)]
+        )
+        assert root.list_entries("episodes-in") == StorageListing(
+            directories=["deep"], files=[("run_0001.mcap", 5)]
+        )
+
+    def test_local_missing_prefix_is_empty(self, tmp_path: Path) -> None:
+        assert LocalStorageRoot(tmp_path).list_entries("absent") == StorageListing(
+            directories=[], files=[]
+        )
+
+    def test_bucket_root_levels(self, tmp_path: Path) -> None:
+        root, remote_dir = bucket_over_tmp(tmp_path)
+        self._populate(remote_dir)
+        assert root.list_entries() == StorageListing(
+            directories=["episodes-in"], files=[("top.txt", 3)]
+        )
+        # Child names, not full keys: the store's prefixed paths are stripped.
+        assert root.list_entries("episodes-in") == StorageListing(
+            directories=["deep"], files=[("run_0001.mcap", 5)]
+        )

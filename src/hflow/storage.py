@@ -244,6 +244,19 @@ def _download_to_file_atomically(get_result: Any, destination: Path) -> None:
 
 
 @dataclass(frozen=True)
+class StorageListing:
+    """One directory level of a storage root -- the dashboard's browse shape.
+
+    ``list_names`` stays the recursive everything-under-here primitive the
+    mirror sync needs; this is the human-paced complement: immediate child
+    directories and ``(name, size-in-bytes)`` files only.
+    """
+
+    directories: list[str]
+    files: list[tuple[str, int]]
+
+
+@dataclass(frozen=True)
 class LocalStorageRoot:
     """A data root on the local filesystem -- the pure-stdlib fast path.
 
@@ -336,6 +349,17 @@ class LocalStorageRoot:
             for entry in base.rglob("*")
             if entry.is_file()
         )
+
+    def list_entries(self, prefix: str = "") -> StorageListing:
+        """One directory level under ``prefix`` (see :class:`StorageListing`)."""
+        base = self.path / _validated_relative_key(prefix) if prefix else self.path
+        if not base.is_dir():
+            return StorageListing(directories=[], files=[])
+        directories = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
+        files = sorted(
+            (entry.name, entry.stat().st_size) for entry in base.iterdir() if entry.is_file()
+        )
+        return StorageListing(directories=directories, files=files)
 
     def fetch(self, relative: str) -> Path:
         """The local file at ``relative`` (it already lives here)."""
@@ -484,6 +508,22 @@ class BucketStorageRoot:
         for batch in obstore.list(self._get_store(), list_prefix):
             names.extend(str(meta["path"]) for meta in batch)
         return sorted(names)
+
+    def list_entries(self, prefix: str = "") -> StorageListing:
+        """One delimiter level under ``prefix`` (see :class:`StorageListing`)."""
+        obstore = _load_obstore()
+        validated_prefix = _validated_relative_key(prefix) if prefix else ""
+        listing = obstore.list_with_delimiter(self._get_store(), validated_prefix or None)
+        # The store returns full keys; the browse shape wants child names.
+        strip = f"{validated_prefix}/" if validated_prefix else ""
+        directories = sorted(
+            str(common_prefix).removeprefix(strip) for common_prefix in listing["common_prefixes"]
+        )
+        files = sorted(
+            (str(meta["path"]).removeprefix(strip), int(meta["size"]))
+            for meta in listing["objects"]
+        )
+        return StorageListing(directories=directories, files=files)
 
     def fetch(self, relative: str) -> Path:
         """The object at ``relative`` as a local file in the mirror.
