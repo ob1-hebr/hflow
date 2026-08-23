@@ -7,11 +7,14 @@ handler in :mod:`hflow.ui._server` owns transport only. Errors travel as
 copyable command.
 """
 
+import json
 import re
+import urllib.parse
 from typing import Any
 
 from hflow import __version__
-from hflow.runtime import AirflowClientError
+from hflow.runtime import AirflowClient, AirflowClientError, bundle_dag_ids
+from hflow.steps import Stage
 from hflow.ui._state import UiState
 
 JsonResponse = tuple[int, dict[str, Any]]
@@ -81,3 +84,192 @@ def airflow_credentials_handler(
         "username": state.bundle.admin_username,
         "password": state.bundle.admin_password,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pipelines
+
+
+def _airflow_run_url(base_url: str, dag_id: str, dag_run_id: str) -> str:
+    """The Airflow 3 UI page for one run; run ids carry ``+`` and ``:``."""
+    return f"{base_url}/dags/{dag_id}/runs/{urllib.parse.quote(dag_run_id, safe='')}"
+
+
+# The trigger task's state seen from the MASTER run encodes the stage outcome
+# (wait_for_completion=True). ``upstream_failed`` means the stage never ran
+# because an earlier one failed -- that is "pending", not a failure of its own.
+_TRIGGER_STATE_TO_STAGE_STATE = {
+    "success": "success",
+    "failed": "failed",
+    "running": "running",
+    "deferred": "running",
+    "queued": "running",
+    "scheduled": "running",
+    "restarting": "running",
+    "up_for_retry": "running",
+    "up_for_reschedule": "running",
+}
+
+_TERMINAL_RUN_STATES = frozenset({"success", "failed"})
+_STAGE_CACHE_LIMIT = 500
+
+
+def _derive_stage_states(task_instances: list[dict[str, Any]]) -> dict[str, str]:
+    states_by_task_id = {
+        str(instance.get("task_id")): str(instance.get("state"))
+        for instance in task_instances
+        if instance.get("state") is not None
+    }
+    stage_states: dict[str, str] = {}
+    for stage in Stage:
+        if states_by_task_id.get(f"enabled_{stage.value}") == "skipped":
+            stage_states[stage.value] = "skipped"
+            continue
+        trigger_state = states_by_task_id.get(f"trigger_{stage.value}")
+        stage_states[stage.value] = _TRIGGER_STATE_TO_STAGE_STATE.get(
+            trigger_state or "", "pending"
+        )
+    return stage_states
+
+
+def _stages_for_run(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, str]:
+    run_id = str(run.get("dag_run_id"))
+    cached = state.stage_cache.get(run_id)
+    if cached is not None:
+        return cached
+    try:
+        instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
+    except AirflowClientError:
+        return {stage.value: "pending" for stage in Stage}
+    stage_states = _derive_stage_states(instances)
+    if str(run.get("state")) in _TERMINAL_RUN_STATES:
+        # Finished runs never change again; keep the poll at one Airflow call
+        # plus one per still-active run. The cap is a leak guard, not an LRU.
+        if len(state.stage_cache) >= _STAGE_CACHE_LIMIT:
+            state.stage_cache.clear()
+        state.stage_cache[run_id] = stage_states
+    return stage_states
+
+
+def _run_duration_s(run: dict[str, Any]) -> float | None:
+    from datetime import datetime
+
+    start_date, end_date = run.get("start_date"), run.get("end_date")
+    if not isinstance(start_date, str) or not isinstance(end_date, str):
+        return None
+    try:
+        started = datetime.fromisoformat(start_date)
+        ended = datetime.fromisoformat(end_date)
+    except ValueError:
+        return None
+    return round((ended - started).total_seconds(), 1)
+
+
+def _run_summary(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, Any]:
+    assert state.bundle is not None
+    raw_conf = run.get("conf")
+    conf: dict[str, Any] = raw_conf if isinstance(raw_conf, dict) else {}
+    uris = conf.get("uris")
+    run_id = str(run.get("dag_run_id"))
+    return {
+        "run_id": run_id,
+        "state": run.get("state"),
+        "run_after": run.get("run_after") or run.get("logical_date"),
+        "start_date": run.get("start_date"),
+        "end_date": run.get("end_date"),
+        "duration_s": _run_duration_s(run),
+        "profile": conf.get("profile"),
+        "mode": conf.get("mode"),
+        "episode_count": len(uris) if isinstance(uris, list) else None,
+        "airflow_url": _airflow_run_url(state.bundle.api_base_url, dag_id, run_id),
+        "stages": _stages_for_run(state, dag_id, run),
+    }
+
+
+def _fetch_runs(client: AirflowClient, dag_id: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        return client.dag_runs(dag_id, limit=limit, order_by="-run_after")
+    except AirflowClientError as error:
+        # Sort-field vocabulary is the API's; an older server that rejects
+        # ``run_after`` still lists fine unsorted (we re-sort client-side).
+        if error.status in (400, 422):
+            return client.dag_runs(dag_id, limit=limit)
+        raise
+
+
+def runs_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    if state.bundle is None:
+        return _error(503, "no runtime bundle found", hint=_RUNTIME_DOWN_HINT)
+    dag_id = state.bundle.dag_id
+    limit = max(1, min(100, int(query.get("limit", ["25"])[0])))
+    try:
+        runs = state.airflow_call(lambda client: _fetch_runs(client, dag_id, limit))
+    except AirflowClientError as error:
+        return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
+    runs.sort(
+        key=lambda run: str(run.get("run_after") or run.get("logical_date") or ""), reverse=True
+    )
+    return 200, {
+        "dag_id": dag_id,
+        "dag_url": f"{state.bundle.api_base_url}/dags/{dag_id}",
+        "runs": [_run_summary(state, dag_id, run) for run in runs],
+    }
+
+
+def _sub_run_id_from_xcom(state: UiState, dag_id: str, run_id: str, stage: Stage) -> str | None:
+    """The stage run the trigger operator started, best-effort via its XCom."""
+    try:
+        entry = state.airflow_call(
+            lambda client: client.xcom_entry(
+                dag_id, run_id, f"trigger_{stage.value}", "trigger_run_id"
+            )
+        )
+    except AirflowClientError:
+        return None
+    value = entry.get("value")
+    if isinstance(value, str) and value.startswith('"'):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value if isinstance(value, str) and value else None
+
+
+def run_detail_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    if state.bundle is None:
+        return _error(503, "no runtime bundle found", hint=_RUNTIME_DOWN_HINT)
+    dag_id = state.bundle.dag_id
+    run_id = urllib.parse.unquote(match.group("run_id"))
+    try:
+        run = state.airflow_call(lambda client: client.dag_run(dag_id, run_id))
+    except AirflowClientError as error:
+        if error.status == 404:
+            return _error(404, f"no run {run_id!r} on {dag_id}")
+        return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
+    summary = _run_summary(state, dag_id, run)
+    base_url = state.bundle.api_base_url
+    stage_dag_ids = dict(zip(Stage, bundle_dag_ids(dag_id)[1:], strict=True))
+    stages: list[dict[str, Any]] = []
+    for stage in Stage:
+        sub_dag_id = stage_dag_ids[stage]
+        stage_state = summary["stages"][stage.value]
+        sub_run_id = None
+        if stage_state not in ("pending", "skipped"):
+            sub_run_id = _sub_run_id_from_xcom(state, dag_id, run_id, stage)
+        stages.append(
+            {
+                "stage": stage.value,
+                "sub_dag_id": sub_dag_id,
+                "state": stage_state,
+                "sub_dag_url": f"{base_url}/dags/{sub_dag_id}",
+                "sub_run_id": sub_run_id,
+                "sub_run_url": (
+                    _airflow_run_url(base_url, sub_dag_id, sub_run_id) if sub_run_id else None
+                ),
+            }
+        )
+    return 200, {"run": summary, "stages": stages}

@@ -23,6 +23,8 @@ from urllib.parse import parse_qs
 from hflow.ui._handlers import (
     JsonResponse,
     airflow_credentials_handler,
+    run_detail_handler,
+    runs_handler,
     status_handler,
 )
 from hflow.ui._state import UiState
@@ -30,6 +32,8 @@ from hflow.ui._state import UiState
 _ROUTES: list[tuple[str, re.Pattern[str], Any]] = [
     ("GET", re.compile(r"^/api/status$"), status_handler),
     ("GET", re.compile(r"^/api/airflow-credentials$"), airflow_credentials_handler),
+    ("GET", re.compile(r"^/api/pipelines/runs$"), runs_handler),
+    ("GET", re.compile(r"^/api/pipelines/runs/(?P<run_id>[^/]+)$"), run_detail_handler),
 ]
 
 _ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
