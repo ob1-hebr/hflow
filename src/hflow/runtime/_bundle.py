@@ -65,7 +65,11 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from hflow._user_config import format_env_text, parse_env_text
+from hflow._user_config import (
+    ensure_secrets_file,
+    format_env_text,
+    parse_env_text,
+)
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -297,6 +301,7 @@ def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_n
             hflow_install_target = "/opt/hflow-src[bucket]"
     return COMPOSE_TEMPLATE.substitute(
         project_name=project_name,
+        user_secrets_env_file=_compose_path_scalar(ensure_secrets_file()),
         data_volume_line=data_volume_line,
         xcom_objectstorage_path=xcom_objectstorage_path,
         bucket_credentials_env=bucket_credentials_env,

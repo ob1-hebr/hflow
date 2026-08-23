@@ -309,6 +309,32 @@ def test_supplied_admin_password_lands_in_env(config: RuntimeConfig, tmp_path: P
     assert paths.admin_password == "hunter2"
 
 
+def test_compose_wires_user_secrets_env_file(config: RuntimeConfig, tmp_path: Path) -> None:
+    import stat
+
+    from hflow._user_config import secrets_file_path
+
+    _, compose = _render(config, tmp_path / "bundle")
+    expected_entry = [{"path": str(secrets_file_path()), "required": False}]
+    # Every Airflow service inherits x-airflow-common (tasks run inside them
+    # under LocalExecutor); the non-Airflow services must get nothing.
+    for service_name in AIRFLOW_SERVICE_NAMES:
+        assert compose["services"][service_name]["env_file"] == expected_entry
+    for service_name in ("postgres", "user-venv-init"):
+        assert "env_file" not in compose["services"][service_name]
+    # Rendering guarantees the referenced file exists, owner-only.
+    assert secrets_file_path().is_file()
+    assert stat.S_IMODE(secrets_file_path().stat().st_mode) == 0o600
+
+
+def test_render_preserves_existing_user_secrets(config: RuntimeConfig, tmp_path: Path) -> None:
+    from hflow._user_config import read_secrets, set_secret
+
+    set_secret("OPENAI_API_KEY", "sk-kept")
+    _render(config, tmp_path / "bundle")
+    assert read_secrets() == {"OPENAI_API_KEY": "sk-kept"}
+
+
 def test_master_dag_source_compiles_and_encodes_contract(
     config: RuntimeConfig, tmp_path: Path
 ) -> None:
