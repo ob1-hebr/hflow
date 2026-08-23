@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hflow</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%237BE87B'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar__brand">
+      <svg class="topbar__glyph" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect width="16" height="16" rx="4" fill="#7BE87B"/></svg>
+      <span class="topbar__name">hflow</span>
+    </div>
+    <nav class="topbar__tabs" aria-label="Sections">
+      <a href="#/pipelines" data-tab="pipelines">Pipelines</a>
+      <a href="#/storage" data-tab="storage">Storage</a>
+      <a href="#/secrets" data-tab="secrets">Secrets</a>
+    </nav>
+    <span class="topbar__version" id="app-version"></span>
+  </header>
+
+  <div class="connection-banner" id="connection-banner" role="status" hidden>Lost connection to hflow ui. Retrying.</div>
+
+  <main class="content">
+    <section id="tab-pipelines" hidden></section>
+    <section id="tab-storage" hidden></section>
+    <section id="tab-secrets" hidden></section>
+  </main>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
