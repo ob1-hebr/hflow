@@ -32,6 +32,8 @@ export function unmount() {
 async function load() {
   try {
     lastData = await api('/api/pipelines/runs?limit=25');
+    // dag_id arrives once at the payload level; the cells read it per run.
+    for (const run of lastData.runs) run.dag_id = lastData.dag_id;
     runtimeDown = false;
   } catch (err) {
     if (err.status === 503) {

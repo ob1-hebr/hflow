@@ -443,3 +443,36 @@ class TestRunDetail:
         with running_ui(observing_state) as base_url:
             status, _ = request_json(base_url, "/api/pipelines/runs/manual__absent")
         assert status == 404
+
+
+class TestStaticAssets:
+    """The packaged frontend serves from memory with explicit content types."""
+
+    def request_raw(self, base_url: str, path: str) -> tuple[int, str, bytes]:
+        request = urllib.request.Request(f"{base_url}{path}")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.headers.get("Content-Type", ""), response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers.get("Content-Type", ""), error.read()
+
+    def test_index_js_and_css_serve_with_types(self, tmp_path: Path) -> None:
+        state = build_ui_state(bundle_dir=tmp_path / "absent", data_root=None)
+        with running_ui(state) as base_url:
+            status, content_type, body = self.request_raw(base_url, "/")
+            assert status == 200
+            assert content_type.startswith("text/html")
+            assert b"hflow" in body
+            status, content_type, _ = self.request_raw(base_url, "/style.css")
+            assert (status, content_type.split(";")[0]) == (200, "text/css")
+            # Nested module files must serve too (the tabs live in js/tabs/).
+            status, content_type, _ = self.request_raw(base_url, "/js/tabs/pipelines.js")
+            assert (status, content_type.split(";")[0]) == (200, "text/javascript")
+
+    def test_unknown_path_is_404(self, tmp_path: Path) -> None:
+        state = build_ui_state(bundle_dir=tmp_path / "absent", data_root=None)
+        with running_ui(state) as base_url:
+            status, _, _ = self.request_raw(base_url, "/../pyproject.toml")
+            assert status == 404
+            status, _, _ = self.request_raw(base_url, "/nothing.js")
+            assert status == 404
