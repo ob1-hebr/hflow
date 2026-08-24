@@ -19,6 +19,8 @@ from hflow.steps import STAGE_INFO, Stage
 from hflow.ui._progress import (
     StageCounts,
     StageWindow,
+    batch_counts,
+    further_along,
     iso_timestamp,
     query_check_breakdown,
     query_stage_counts,
@@ -342,6 +344,7 @@ def _stage_cards(
     stage_dag_ids = dict(zip(Stage, bundle_dag_ids(dag_id)[1:], strict=True))
     windows = stage_windows_from_instances(instances)
     now = datetime.now(UTC)
+    run_finished = str(run.get("state")) in _TERMINAL_RUN_STATES
     catalog_counts = _catalog_counts(state, run, windows, now)
 
     cards: list[dict[str, Any]] = []
@@ -352,12 +355,18 @@ def _stage_cards(
         facts = _stage_orchestration_facts(state, dag_id, run_id, stage, stage_state, sub_dag_id)
         window = windows.get(stage)
         gate: StageCounts | None = facts["gate_counts"]
-        # A readable catalog that names no episodes for this stage is the
-        # answer "none through yet", which is not the same as having no
-        # catalog to ask (progress stays null only for the latter).
         counts = gate
-        if counts is None and catalog_counts is not None:
-            counts = catalog_counts.get(stage, StageCounts())
+        if counts is None:
+            # A readable catalog that names no episodes for this stage is the
+            # answer "none through yet", which is not the same as having no
+            # catalog to ask (progress stays null only for the latter). The
+            # batch count needs no catalog at all, so it stands on its own.
+            counts = further_along(
+                catalog_counts.get(stage, StageCounts()) if catalog_counts is not None else None,
+                _batch_counts(state, sub_dag_id, facts["sub_run_id"])
+                if stage_state == "running"
+                else None,
+            )
         # A finished stage counted its own episodes; before then, the run's
         # conf is the only statement of how many there are to do.
         total = gate.done if gate is not None else episode_count
@@ -368,9 +377,14 @@ def _stage_cards(
                 "description": info.description,
                 "layer": info.layer.value,
                 "state": stage_state,
+                # A stage of a finished run is not waiting on anything: the run
+                # ended before it ever got its turn.
                 "waiting_on": (
-                    _waiting_on(stage, stage_states) if stage_state == "pending" else None
+                    _waiting_on(stage, stage_states)
+                    if stage_state == "pending" and not run_finished
+                    else None
                 ),
+                "reached": stage_state != "pending" or not run_finished,
                 "total": total,
                 "started_at": iso_timestamp(window.start) if window else None,
                 "ended_at": iso_timestamp(window.end) if window and window.end else None,
@@ -444,6 +458,41 @@ def _window_duration_s(window: StageWindow | None) -> float | None:
     if window is None or window.end is None:
         return None
     return round((window.end - window.start).total_seconds(), 1)
+
+
+def _batch_counts(state: UiState, sub_dag_id: str, sub_run_id: str | None) -> StageCounts | None:
+    """A running stage's progress counted by whole batches, best-effort.
+
+    The plan is fixed for the life of a sub-run, so it is fetched once; the
+    batch task instances are what changes as the stage works through them.
+    """
+    if sub_run_id is None:
+        return None
+    plan = state.stage_plan_cache.get(sub_run_id)
+    if plan is None:
+        try:
+            entry = state.airflow_call(
+                lambda client: client.xcom_entry(sub_dag_id, sub_run_id, "plan", "return_value")
+            )
+        except AirflowClientError:
+            return None
+        value = entry.get("value")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(value, list):
+            return None
+        plan = [entry for entry in value if isinstance(entry, dict)]
+        if len(state.stage_plan_cache) >= _STAGE_CACHE_LIMIT:
+            state.stage_plan_cache.clear()
+        state.stage_plan_cache[sub_run_id] = plan
+    try:
+        instances = state.airflow_call(lambda client: client.task_instances(sub_dag_id, sub_run_id))
+    except AirflowClientError:
+        return None
+    return batch_counts(plan, instances)
 
 
 def _catalog_counts(

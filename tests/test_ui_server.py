@@ -574,8 +574,8 @@ class TestRunDetail:
         with running_ui(observing_state) as base_url:
             _, payload = request_json(base_url, f"/api/pipelines/runs/{ENCODED_SUCCESS_RUN_ID}")
         cards = {card["stage"]: card for card in payload["stages"]}
-        assert cards["meta"]["title"] == "Metadata"
-        assert cards["meta"]["description"].startswith("Quality checks")
+        assert cards["meta"]["title"] == "Quality checks"
+        assert "quarantine" in cards["meta"]["description"]
         assert cards["meta"]["layer"] == "automated"
         assert cards["labels"]["layer"] == "model"
         assert all(card["progress"] is None for card in cards.values())
@@ -763,6 +763,49 @@ class TestStageCardProgress:
         assert cards["meta"]["waiting_on"] is None
         assert cards["sync"]["state"] == "skipped"
         assert cards["sync"]["waiting_on"] is None
+
+    def test_a_replayed_run_still_shows_progress_by_batch(self, catalog_state: UiState) -> None:
+        # A run over episodes already recorded appends nothing new (the catalog
+        # dedupes), so the finished batches are the only evidence of progress.
+        seed_progress_run(run_state="running", stage_windows={"meta": (120, None)})
+        sub_run_id = "manual__sub-meta"
+        _StubAirflowHandler.xcom_values = {
+            (PROGRESS_RUN_ID, "trigger_meta"): sub_run_id,
+            (sub_run_id, "plan"): json.dumps(
+                [{"items": PROGRESS_URIS[:3]}, {"items": PROGRESS_URIS[3:]}]
+            ),
+        }
+        _StubAirflowHandler.task_instances_by_run[sub_run_id] = [
+            {
+                "task_id": "process_batch",
+                "state": "success",
+                "map_index": 0,
+                "end_date": datetime.now(UTC).isoformat(),
+            },
+            {"task_id": "process_batch", "state": "running", "map_index": 1, "end_date": None},
+        ]
+        with running_ui(catalog_state) as base_url:
+            _, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        meta = {card["stage"]: card for card in payload["stages"]}["meta"]
+        # The three episodes of the finished batch; the batch in flight counts
+        # for nothing until it ends.
+        assert meta["progress"]["done"] == 3
+        assert meta["progress"]["eta_s"] > 0
+
+    def test_stages_of_a_failed_run_are_not_waiting_on_anything(
+        self, catalog_state: UiState
+    ) -> None:
+        # Airflow leaves the stages after a failure upstream_failed, which the
+        # stage vocabulary reads as pending; they never ran and never will.
+        seed_progress_run(run_state="failed", stage_windows={"sync": (120, 60)})
+        _StubAirflowHandler.dag_run_list[0]["state"] = "failed"
+        with running_ui(catalog_state) as base_url:
+            _, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        cards = {card["stage"]: card for card in payload["stages"]}
+        assert cards["labels"]["state"] == "pending"
+        assert cards["labels"]["waiting_on"] is None
+        assert cards["labels"]["reached"] is False
+        assert cards["sync"]["reached"] is True
 
     def test_a_finished_stage_prefers_its_own_tally_and_is_computed_once(
         self, catalog_state: UiState
@@ -1192,7 +1235,12 @@ class TestStaticAssets:
             status, content_type, _ = self.request_raw(base_url, "/style.css")
             assert (status, content_type.split(";")[0]) == (200, "text/css")
             # Nested module files must serve too (the tabs live in js/tabs/).
-            for module in ("/js/graph.js", "/js/tabs/pipelines.js", "/js/tabs/pipelines_run.js"):
+            for module in (
+                "/js/graph.js",
+                "/js/stage_cards.js",
+                "/js/tabs/pipelines.js",
+                "/js/tabs/pipelines_run.js",
+            ):
                 status, content_type, _ = self.request_raw(base_url, module)
                 assert (status, content_type.split(";")[0]) == (200, "text/javascript")
 

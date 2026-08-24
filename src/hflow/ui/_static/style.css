@@ -558,6 +558,81 @@ tr:hover .cell-run-wrap .icon-button,
 .batches-table__index { width: 30px; color: var(--dim); }
 .batches-table__link { width: 30px; text-align: right; }
 
+/* --- stage cards: the run's pipeline, stage by stage -------------------------------- */
+
+.run-header__spacer { flex: 1; }
+.run-header .icon-button { margin-left: 0; }
+.text-link { color: var(--dim); text-decoration: none; font-size: 12.5px; }
+.text-link:hover { color: var(--text); text-decoration: underline; }
+
+.stage-cards { display: flex; flex-direction: column; gap: var(--s3); max-width: 860px; }
+.stage-card {
+  display: flex;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--border-strong);
+  border-radius: var(--r-lg);
+}
+.stage-card[role="button"] { cursor: pointer; }
+.stage-card[role="button"]:hover { background: var(--surface-2); }
+.stage-card--running { border-left-color: var(--accent); }
+.stage-card--success { border-left-color: var(--ok); }
+.stage-card--failed { border-left-color: var(--error); }
+.stage-card--skipped { opacity: .55; }
+.stage-card--stalled { border-left-color: var(--warn); }
+.stage-card__num {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  line-height: 1.2;
+  color: var(--faint);
+}
+.stage-card__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.stage-card__head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.stage-card__title { font-size: 14px; font-weight: 500; }
+.stage-card__spacer { flex: 1; }
+.stage-card__chevron { color: var(--faint); display: inline-flex; }
+.stage-card[role="button"]:hover .stage-card__chevron { color: var(--dim); }
+.stage-card__desc { font-size: 12.5px; color: var(--dim); }
+.stage-card__metrics { font-size: 12.5px; color: var(--dim); }
+.stage-card__stalled { font-size: 12.5px; color: var(--warn); }
+.metric-sep { color: var(--faint); margin: 0 var(--s1); }
+.metric--warn { color: var(--warn); }
+.metric--error { color: var(--error); }
+
+.progress { display: flex; align-items: center; gap: var(--s3); }
+.progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--surface-2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.progress-bar__fill { height: 100%; background: var(--accent); border-radius: 2px; }
+.stage-card--success .progress-bar__fill { background: var(--ok); }
+.stage-card--failed .progress-bar__fill { background: var(--error); }
+.progress__count {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.stage-checks { max-width: 860px; margin: var(--s4) 0; }
+.stage-checks__title { font-size: 13px; font-weight: 500; margin-bottom: var(--s2); }
+.stage-checks__note { font-size: 12.5px; color: var(--dim); margin: var(--s4) 0; }
+.checks-table__name { font-family: var(--font-mono); font-size: 12px; margin-right: var(--s2); }
+.status-count {
+  font-size: 11.5px;
+  color: var(--dim);
+  margin-right: var(--s3);
+  white-space: nowrap;
+}
+.status-count--passed { color: var(--ok); }
+.status-count--failed, .status-count--error { color: var(--error); }
+.status-count--skipped { color: var(--faint); }
+
 /* --- storage tab ---------------------------------------------------------------------- */
 
 .roots-table .col-kind { width: 70px; }

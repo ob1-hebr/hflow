@@ -176,6 +176,61 @@ def query_stage_counts(
     return tallies
 
 
+def batch_counts(plan: list[dict[str, Any]], instances: list[dict[str, Any]]) -> StageCounts | None:
+    """Episodes finished, counted by whole batches, or None when unknowable.
+
+    The catalog goes quiet when a run replays work it already recorded (the
+    append is idempotent, so nothing new lands), and a stage in that state
+    would otherwise read as making no progress at all. A batch task that has
+    ended did finish every episode in its slice either way, so the plan's own
+    batch composition gives an exact lower bound that survives the replay.
+
+    Both this and the catalog undercount rather than over, so the caller takes
+    whichever is further along.
+    """
+    if not plan:
+        return None
+    sizes = [len(entry.get("items") or ()) for entry in plan]
+    ended = [
+        instance
+        for instance in instances
+        if str(instance.get("task_id")) == "process_batch"
+        and str(instance.get("state") or "") in _ENDED_TASK_STATES
+    ]
+    if not ended:
+        return StageCounts()
+    done = 0
+    for instance in ended:
+        index = instance.get("map_index")
+        if isinstance(index, int) and 0 <= index < len(sizes):
+            done += sizes[index]
+    ends = [parse_timestamp(instance.get("end_date")) for instance in ended]
+    finished_at = [end for end in ends if end is not None]
+    return StageCounts(done=done, last_completed_at=max(finished_at) if finished_at else None)
+
+
+# A batch task in any of these states has stopped working on its episodes.
+_ENDED_TASK_STATES = frozenset({"success", "failed", "skipped", "upstream_failed"})
+
+
+def further_along(first: StageCounts | None, second: StageCounts | None) -> StageCounts | None:
+    """Whichever of two undercounts got further, keeping the richer detail."""
+    if first is None:
+        return second
+    if second is None or second.done <= first.done:
+        return first
+    # The batch count knows nothing of quarantine or errors; the catalog does.
+    return StageCounts(
+        done=second.done,
+        quarantined=first.quarantined,
+        errors=first.errors,
+        last_completed_at=max(
+            (stamp for stamp in (first.last_completed_at, second.last_completed_at) if stamp),
+            default=None,
+        ),
+    )
+
+
 def query_check_breakdown(
     catalog_root: Path,
     uris: list[str],

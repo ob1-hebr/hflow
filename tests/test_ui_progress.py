@@ -10,6 +10,8 @@ from hflow.steps import Stage
 from hflow.ui._progress import (
     StageCounts,
     StageWindow,
+    batch_counts,
+    further_along,
     stage_progress,
     stage_windows_from_instances,
 )
@@ -89,6 +91,71 @@ class TestStallDetection:
         # An exact replay appends nothing (the pipeline dedupes), so silence
         # here means "no baseline", not "stuck".
         assert progress(StageCounts(), total=20, window=running_window(3600))["stalled"] is False
+
+
+PLAN = [{"items": ["a", "b", "c"]}, {"items": ["d", "e"]}, {"items": ["f"]}]
+
+
+class TestBatchCounts:
+    """The fallback for a replayed run, where the catalog stays silent."""
+
+    def batch(self, map_index: int, state: str, *, end: str | None = None) -> dict:
+        return {
+            "task_id": "process_batch",
+            "state": state,
+            "map_index": map_index,
+            "end_date": end,
+        }
+
+    def test_only_finished_batches_count(self) -> None:
+        counts = batch_counts(
+            PLAN,
+            [
+                {"task_id": "plan", "state": "success", "map_index": -1},
+                self.batch(0, "success", end="2026-08-24T12:00:00+00:00"),
+                self.batch(1, "running"),
+                self.batch(2, "queued"),
+            ],
+        )
+        assert counts is not None
+        # The three episodes of the finished batch, not the two in flight.
+        assert counts.done == 3
+        assert counts.last_completed_at == datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+
+    def test_a_failed_batch_still_finished_its_episodes(self) -> None:
+        counts = batch_counts(PLAN, [self.batch(0, "success"), self.batch(1, "failed")])
+        assert counts is not None
+        assert counts.done == 5
+
+    def test_nothing_finished_yet_is_zero_not_unknown(self) -> None:
+        assert batch_counts(PLAN, [self.batch(0, "running")]) == StageCounts()
+
+    def test_no_plan_means_no_answer(self) -> None:
+        assert batch_counts([], [self.batch(0, "success")]) is None
+
+
+class TestFurtherAlong:
+    def test_the_batch_count_wins_when_the_catalog_is_silent(self) -> None:
+        # The replay case: no appends landed, but two batches are through.
+        merged = further_along(StageCounts(), StageCounts(done=6))
+        assert merged is not None
+        assert merged.done == 6
+
+    def test_the_catalog_wins_when_it_is_ahead_and_keeps_its_detail(self) -> None:
+        catalog = StageCounts(done=9, quarantined=2, errors=1)
+        merged = further_along(catalog, StageCounts(done=6))
+        assert merged == catalog
+
+    def test_a_batch_lead_keeps_the_catalog_s_quarantine_detail(self) -> None:
+        catalog = StageCounts(done=3, quarantined=1, errors=1)
+        merged = further_along(catalog, StageCounts(done=6))
+        assert merged is not None
+        assert (merged.done, merged.quarantined, merged.errors) == (6, 1, 1)
+
+    def test_a_missing_source_is_not_an_answer(self) -> None:
+        assert further_along(None, StageCounts(done=2)) == StageCounts(done=2)
+        assert further_along(StageCounts(done=2), None) == StageCounts(done=2)
+        assert further_along(None, None) is None
 
 
 class TestStageWindows:

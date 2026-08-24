@@ -1,16 +1,25 @@
-// Run page: one run's DAG with live task state, so following a run never
-// means going to find it in Airflow's own UI. Polls every 3s while the run is
-// active and stops once it finishes -- a run that ended cannot change again.
+// One run, at three altitudes.
 //
-// The same page renders a stage's own run: the master's trigger nodes drill
-// into it, and the backend resolves which sub-run that was, so the only run
-// id this module ever holds is the master's.
+//   ?id=<run>                 the pipeline as its stages: what each one is
+//                             for, how many episodes are through, what is
+//                             holding the rest up. The default, because that
+//                             is the question an operator actually has.
+//   ?id=<run>&stage=<stage>    one stage: its progress, what its checks found,
+//                             and the batch tasks that did the work.
+//   ?id=<run>&graph=tasks      the master DAG's own tasks, for when the
+//                             orchestration itself is the suspect.
+//
+// Polls every 3s while the run is active and stops once it finishes -- a run
+// that ended cannot change again. The stage views never hold a sub-run id:
+// the backend resolves which run a stage was, so the only id here is the
+// master's.
 
 import { api } from '../api.js';
 import { Poller } from '../app.js';
 import { createDagGraph } from '../graph.js';
+import { checksTable, createStageCards } from '../stage_cards.js';
 import {
-  h, icon, statusDot, stageStrip, chip, copyButton, callout, duration, relTime,
+  h, icon, statusDot, chip, copyButton, callout, duration, relTime,
 } from '../ui.js';
 
 const POLL_MS = 3000;
@@ -19,32 +28,41 @@ const TERMINAL_RUN_STATES = new Set(['success', 'failed']);
 let container = null;
 let poller = null;
 let runId = null;
-let stage = null;         // the stage being drilled into, null on the master page
-let data;                 // last successful graph payload
-let mode = null;          // 'pending' | 'graph' | 'down' | 'missing' | 'no-run'
+let stage = null;         // the stage being drilled into, null otherwise
+let view = null;          // 'cards' | 'stage' | 'tasks'
+let data;                 // last successful payload for this view
+let mode = null;          // 'pending' | 'cards' | 'stage' | 'graph' | 'down' | 'missing' | 'no-run'
+let cards = null;
 let graph = null;
 let headerEl = null;
 let headerSignature = null;
+let checksSlot = null;
+let checksSignature = null;
 let panelSlot = null;
 let panelSignature = null;
 let selectedId = null;
 
-export function runHash(id, stageName = null) {
+export function runHash(id, { stage: stageName = null, graph: graphName = null } = {}) {
   // Run ids carry '+' and ':', so the query is always built with
   // encodeURIComponent -- never by hand.
-  const suffix = stageName ? `&stage=${encodeURIComponent(stageName)}` : '';
-  return `#/pipelines/run?id=${encodeURIComponent(id)}${suffix}`;
+  const parts = [`id=${encodeURIComponent(id)}`];
+  if (stageName) parts.push(`stage=${encodeURIComponent(stageName)}`);
+  if (graphName) parts.push(`graph=${encodeURIComponent(graphName)}`);
+  return `#/pipelines/run?${parts.join('&')}`;
 }
 
 export function mount(section, params) {
   container = section;
   runId = params.id || null;
   stage = params.stage || null;
+  view = stage ? 'stage' : params.graph === 'tasks' ? 'tasks' : 'cards';
   data = undefined;
   mode = null;
+  cards = null;
   graph = null;
   selectedId = null;
   panelSignature = null;
+  checksSignature = null;
   document.addEventListener('keydown', onKeydown);
   if (!runId) {
     renderMessage('no-run', {
@@ -54,7 +72,7 @@ export function mount(section, params) {
     return;
   }
   // Paint this page's own frame right away: the runs table must not linger
-  // on screen while the first graph loads.
+  // on screen while the first fetch loads.
   mode = 'pending';
   container.replaceChildren(crumbs(), h('div', { class: 'block-pending' }, 'Loading'));
   if (!poller) poller = new Poller(load, POLL_MS);
@@ -71,17 +89,19 @@ function onKeydown(event) {
   if (event.key === 'Escape' && selectedId) selectNode(null);
 }
 
-function graphPath(id) {
-  const base = `/api/pipelines/runs/${encodeURIComponent(id)}`;
-  return stage ? `${base}/stages/${encodeURIComponent(stage)}/graph` : `${base}/graph`;
+// --- loading ------------------------------------------------------------------
+
+function runPath(id) {
+  return `/api/pipelines/runs/${encodeURIComponent(id)}`;
 }
 
 async function load() {
-  const [requested, requestedStage] = [runId, stage];
-  const stale = () => requested !== runId || requestedStage !== stage || container === null;
+  const [requested, requestedStage, requestedView] = [runId, stage, view];
+  const stale = () =>
+    requested !== runId || requestedStage !== stage || requestedView !== view || container === null;
   let payload;
   try {
-    payload = await api(graphPath(requested));
+    payload = await fetchView(requested, requestedStage, requestedView);
   } catch (err) {
     if (stale()) return; // navigated away mid-request
     if (err.status === 404) {
@@ -106,74 +126,69 @@ async function load() {
   if (finished()) poller.stop();
 }
 
+function fetchView(id, stageName, viewName) {
+  const base = runPath(id);
+  if (viewName === 'tasks') return api(`${base}/graph`);
+  if (viewName === 'cards') return api(base);
+  const stagePath = `${base}/stages/${encodeURIComponent(stageName)}`;
+  return Promise.all([api(base), api(`${stagePath}/checks`), api(`${stagePath}/graph`)]).then(
+    ([run, checks, graphData]) => ({ ...graphData, run_detail: run, checks: checks.checks }),
+  );
+}
+
 function finished() {
-  if (!stage) return TERMINAL_RUN_STATES.has(data.run.state);
+  if (view === 'cards') return TERMINAL_RUN_STATES.has(data.run.state);
+  if (view === 'tasks') return TERMINAL_RUN_STATES.has(data.run.state);
   // A stage that never started still settles once its master run does.
   return TERMINAL_RUN_STATES.has(data.master_state)
     && (data.run === null || TERMINAL_RUN_STATES.has(data.run.state));
 }
 
-// --- rendering ---------------------------------------------------------------
+// --- rendering ----------------------------------------------------------------
 
 function crumbs() {
+  const onRunPage = view === 'cards';
   return h('div', { class: 'browse-crumbs' },
     h('a', { class: 'crumb-back', href: '#/pipelines' }, '‹ Runs'),
-    stage
-      ? h('a', { class: 'crumb', href: runHash(runId), title: runId }, runId)
-      : h('span', { class: 'crumb crumb--current', title: runId }, runId),
-    stage ? h('span', { class: 'crumb-sep' }, '/') : null,
-    stage ? h('span', { class: 'crumb crumb--current' }, stage) : null);
+    onRunPage
+      ? h('span', { class: 'crumb crumb--current', title: runId }, runId)
+      : h('a', { class: 'crumb', href: runHash(runId), title: runId }, runId),
+    onRunPage ? null : h('span', { class: 'crumb-sep' }, '/'),
+    onRunPage ? null : h('span', { class: 'crumb crumb--current' }, stage || 'task graph'));
 }
 
 function renderMessage(nextMode, { title, body, command }) {
   if (mode === nextMode) return;
   mode = nextMode;
+  cards = null;
   graph = null;
   container.replaceChildren(crumbs(), callout({ title, body, command }));
 }
 
 function render() {
-  if (mode !== 'graph') {
-    mode = 'graph';
-    graph = createDagGraph({
-      onSelect: selectNode,
-      // Only the master's trigger nodes carry a stage, so only they drill in.
-      onDrillIn: stage ? null : (stageName) => { location.hash = runHash(runId, stageName); },
+  if (view === 'cards') renderCards();
+  else if (view === 'stage') renderStage();
+  else renderTaskGraph();
+}
+
+// --- the stage list: the run's pipeline ---------------------------------------
+
+function renderCards() {
+  if (mode !== 'cards') {
+    mode = 'cards';
+    cards = createStageCards({
+      onOpen: (stageName) => { location.hash = runHash(runId, { stage: stageName }); },
     });
-    headerEl = header();
-    headerSignature = runSignature(data);
-    panelSlot = h('div', { class: 'panel-slot' });
-    panelSignature = null;
-    container.replaceChildren(
-      crumbs(),
-      headerEl,
-      h('div', { class: 'run-layout' }, graph.el, panelSlot));
-  } else if (runSignature(data) !== headerSignature) {
-    headerSignature = runSignature(data);
-    const next = header();
-    headerEl.replaceWith(next);
-    headerEl = next;
+    headerEl = header(data.run);
+    headerSignature = runSignature(data.run);
+    container.replaceChildren(crumbs(), headerEl, cards.el);
+  } else {
+    refreshHeader(data.run);
   }
-  graph.render(data);
-  graph.select(selectedId);
-  renderPanel();
+  cards.render(data.stages);
 }
 
-function runSignature({ run, master_state: masterState }) {
-  if (run === null) return `none|${masterState}`;
-  return [run.state, run.start_date, run.duration_s, JSON.stringify(run.stages)].join('|');
-}
-
-function header() {
-  if (data.run !== null) return runHeader(data.run);
-  return h('div', { class: 'run-header' },
-    statusDot('pending'),
-    h('span', { class: 'run-header__fact' },
-      `The ${stage} stage has not started -- these are the tasks it will run.`));
-}
-
-function runHeader(run) {
-  const started = run.start_date || run.run_after;
+function header(run) {
   return h('div', { class: 'run-header' },
     statusDot(run.state),
     h('span', { class: 'run-header__id', title: run.run_id }, run.run_id),
@@ -181,16 +196,33 @@ function runHeader(run) {
     run.profile ? chip(run.profile) : null,
     h('span', { class: 'run-header__fact' },
       run.episode_count == null ? '—' : `${run.episode_count} episodes`),
-    started
-      ? h('span', { class: 'run-header__fact', dataset: { relTs: started }, title: started },
-          relTime(started))
+    run.start_date || run.run_after
+      ? h('span', {
+          class: 'run-header__fact',
+          dataset: { relTs: run.start_date || run.run_after },
+          title: run.start_date || run.run_after,
+        }, relTime(run.start_date || run.run_after))
       : null,
     h('span', { class: 'run-header__fact' }, runDuration(run)),
-    run.stages ? stageStrip(run.stages) : null,
+    h('span', { class: 'run-header__spacer' }),
+    h('a', { class: 'text-link', href: runHash(runId, { graph: 'tasks' }) }, 'Task graph'),
     h('a', {
       class: 'icon-button', href: run.airflow_url, target: '_blank',
       rel: 'noopener', title: 'Open in Airflow',
     }, icon('arrow-up-right')));
+}
+
+function refreshHeader(run) {
+  if (runSignature(run) === headerSignature) return;
+  headerSignature = runSignature(run);
+  const next = header(run);
+  headerEl.replaceWith(next);
+  headerEl = next;
+}
+
+function runSignature(run) {
+  if (!run) return 'none';
+  return [run.state, run.start_date, run.duration_s].join('|');
 }
 
 function runDuration(run) {
@@ -199,6 +231,72 @@ function runDuration(run) {
       duration((Date.now() - Date.parse(run.start_date)) / 1000));
   }
   return duration(run.duration_s);
+}
+
+// --- one stage: its card, what its checks found, and the tasks that ran -------
+
+function renderStage() {
+  if (mode !== 'stage') {
+    mode = 'stage';
+    cards = createStageCards({});  // the stage's own card: nothing to open
+    graph = createDagGraph({ onSelect: selectNode, onDrillIn: null });
+    checksSlot = h('div', { class: 'stage-checks' });
+    checksSignature = null;
+    panelSlot = h('div', { class: 'panel-slot' });
+    panelSignature = null;
+    container.replaceChildren(
+      crumbs(),
+      cards.el,
+      checksSlot,
+      h('div', { class: 'run-layout' }, graph.el, panelSlot));
+  }
+  const position = data.run_detail.stages.findIndex((entry) => entry.stage === stage);
+  cards.render(position < 0 ? [] : [data.run_detail.stages[position]], position + 1);
+  renderChecks();
+  graph.render(data);
+  graph.select(selectedId);
+  renderPanel();
+}
+
+function renderChecks() {
+  const signature = JSON.stringify(data.checks);
+  if (signature === checksSignature) return;
+  checksSignature = signature;
+  if (!data.checks.length) {
+    checksSlot.replaceChildren(h('p', { class: 'stage-checks__note' },
+      stage === 'sync'
+        ? 'This stage records episodes, not checks — its evidence is the canonical file itself.'
+        : 'No check evidence recorded for this run yet.'));
+    return;
+  }
+  checksSlot.replaceChildren(
+    h('h4', { class: 'stage-checks__title' }, 'What its checks found'),
+    checksTable(data.checks));
+}
+
+// --- the master task graph, for orchestration questions -----------------------
+
+function renderTaskGraph() {
+  if (mode !== 'graph') {
+    mode = 'graph';
+    graph = createDagGraph({
+      onSelect: selectNode,
+      onDrillIn: (stageName) => { location.hash = runHash(runId, { stage: stageName }); },
+    });
+    headerEl = header(data.run);
+    headerSignature = runSignature(data.run);
+    panelSlot = h('div', { class: 'panel-slot' });
+    panelSignature = null;
+    container.replaceChildren(
+      crumbs(),
+      headerEl,
+      h('div', { class: 'run-layout' }, graph.el, panelSlot));
+  } else {
+    refreshHeader(data.run);
+  }
+  graph.render(data);
+  graph.select(selectedId);
+  renderPanel();
 }
 
 // --- task details panel -------------------------------------------------------
@@ -213,7 +311,7 @@ function selectNode(id) {
 }
 
 function renderPanel() {
-  if (mode !== 'graph') return;
+  if (mode !== 'graph' && mode !== 'stage') return;
   const node = selectedId ? data.nodes.find((entry) => entry.id === selectedId) : null;
   if (!node) {
     // The selected task vanished (a re-render changed the shape): close.
@@ -250,8 +348,9 @@ function taskPanel(node) {
     panelRow('Attempt', node.try_number == null ? '—' : String(node.try_number)),
     mappedBreakdown(node),
     node.stage
-      ? h('a', { class: 'detail-panel__link', href: runHash(runId, node.stage) },
-          `View the ${node.stage} stage`, icon('chevron'))
+      ? h('a', {
+          class: 'detail-panel__link', href: runHash(runId, { stage: node.stage }),
+        }, `View the ${node.stage} stage`, icon('chevron'))
       : null,
     node.airflow_url
       ? h('a', {

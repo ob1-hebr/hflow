@@ -96,27 +96,42 @@ class StageInfo:
     layer: VerificationLayer
 
 
-# Figure 4's sub-DAG display names and one-line purposes, in the blog figure's
-# own words.
+# Figure 4's sub-DAG display names and one-line purposes. These are read by
+# people watching a run -- in the dashboard's stage cards and in the generated
+# DAGs' docs -- so they say what the stage does to the data, not where it sits
+# in the paper's diagram.
 STAGE_INFO: dict[Stage, StageInfo] = {
     Stage.SYNC: StageInfo(
         title="Transform & sync",
-        description="Canonical transform -- the critical path (Figure 4: Transform & sync).",
+        description=(
+            "Turns each raw recording into the canonical episode file every "
+            "later stage reads. The critical path: nothing proceeds without it."
+        ),
         layer=VerificationLayer.AUTOMATED,
     ),
     Stage.META: StageInfo(
-        title="Metadata",
-        description="Quality checks + catalog registration, with the run's quarantine budget.",
+        title="Quality checks",
+        description=(
+            "Runs every registered check over each episode and records the "
+            "evidence in the catalog. Episodes that fail a critical check are "
+            "quarantined; mass failure trips the run's quarantine budget."
+        ),
         layer=VerificationLayer.AUTOMATED,
     ),
     Stage.LABELS: StageInfo(
         title="Labels & artifacts",
-        description="Enrichments -- non-critical, failure isolated.",
+        description=(
+            "Derives labels and artifacts from each episode. Never gates the "
+            "run -- a failure here isolates to the episode it happened on."
+        ),
         layer=VerificationLayer.MODEL,
     ),
     Stage.MEDIA: StageInfo(
         title="Media",
-        description="Derived media: per-camera contact sheets recorded as catalog artifacts.",
+        description=(
+            "Renders per-camera contact sheets so a human can eyeball an "
+            "episode without opening it, recorded as catalog artifacts."
+        ),
         layer=VerificationLayer.AUTOMATED,
     ),
 }

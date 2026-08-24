@@ -65,7 +65,7 @@ function ensureShell() {
   renderedMode = null;
   container.replaceChildren(
     h('div', { class: 'tab-toolbar' },
-      h('p', { class: 'subtitle' }, 'Runs of the ingest DAG. Open a run to follow its pipeline task by task.'),
+      h('p', { class: 'subtitle' }, 'Runs of the ingest DAG. Open a run to follow its pipeline stage by stage.'),
       credentialsButton),
     body);
 }
