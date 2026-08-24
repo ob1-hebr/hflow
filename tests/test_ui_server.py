@@ -825,6 +825,96 @@ class TestStageCardProgress:
         assert cards["sync"]["total"] is None
 
 
+class TestStageChecks:
+    """What one stage's verification found, check by check."""
+
+    def test_breakdown_counts_outcomes_per_check(self, catalog_state: UiState) -> None:
+        assert catalog_state.data_root is not None
+        for index in range(2):
+            append_episode_row(catalog_state.data_root, index)
+        append_episode_row(catalog_state.data_root, 2, quarantined=True)
+        append_episode_row(catalog_state.data_root, 3, errored=True)
+        seed_progress_run(run_state="running", stage_windows={"meta": (120, None)})
+        with running_ui(catalog_state) as base_url:
+            status, payload = request_json(
+                base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}/stages/meta/checks"
+            )
+        assert status == 200
+        assert payload["stage"] == "meta"
+        (camera_health,) = payload["checks"]
+        assert camera_health["name"] == "camera_health"
+        assert camera_health["critical"] is True
+        assert camera_health["statuses"]["failed"] == 1
+        assert camera_health["statuses"]["error"] == 1
+        assert camera_health["statuses"]["passed"] == 0
+        assert camera_health["episodes"] == 2
+        assert camera_health["avg_duration_s"] == 0.5
+
+    def test_appends_outside_the_stage_window_are_not_its_evidence(
+        self, catalog_state: UiState
+    ) -> None:
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0, errored=True)
+        # The stage finished well before that append landed.
+        seed_progress_run(run_state="running", stage_windows={"meta": (600, 500)})
+        with running_ui(catalog_state) as base_url:
+            _, payload = request_json(
+                base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}/stages/meta/checks"
+            )
+        assert payload["checks"] == []
+
+    def test_a_stage_that_records_no_checks_is_empty_not_an_error(
+        self, catalog_state: UiState
+    ) -> None:
+        # sync writes episode rows only; the breakdown has nothing to show.
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0)
+        seed_progress_run(run_state="running", stage_windows={"sync": (60, None)})
+        with running_ui(catalog_state) as base_url:
+            status, payload = request_json(
+                base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}/stages/sync/checks"
+            )
+        assert (status, payload["checks"]) == (200, [])
+
+    def test_without_a_catalog_the_breakdown_is_empty(self, observing_state: UiState) -> None:
+        seed_two_runs()
+        with running_ui(observing_state) as base_url:
+            status, payload = request_json(
+                base_url,
+                f"/api/pipelines/runs/{ENCODED_SUCCESS_RUN_ID}/stages/meta/checks",
+            )
+        assert (status, payload["checks"]) == (200, [])
+
+    def test_unknown_stage_is_404(self, catalog_state: UiState) -> None:
+        seed_progress_run(run_state="running", stage_windows={"meta": (60, None)})
+        with running_ui(catalog_state) as base_url:
+            status, _ = request_json(
+                base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}/stages/annotation/checks"
+            )
+        assert status == 404
+
+    def test_unknown_run_is_404(self, catalog_state: UiState) -> None:
+        seed_progress_run(run_state="running", stage_windows={"meta": (60, None)})
+        with running_ui(catalog_state) as base_url:
+            status, _ = request_json(
+                base_url, "/api/pipelines/runs/manual__absent/stages/meta/checks"
+            )
+        assert status == 404
+
+    def test_a_finished_run_is_read_once(self, catalog_state: UiState) -> None:
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0, errored=True)
+        seed_progress_run(run_state="success", stage_windows={"meta": (120, 0)})
+        path = f"/api/pipelines/runs/{PROGRESS_RUN_ID}/stages/meta/checks"
+        with running_ui(catalog_state) as base_url:
+            _, first = request_json(base_url, path)
+            instances_after_first = list(_StubAirflowHandler.task_instance_requests)
+            _, second = request_json(base_url, path)
+        assert first == second
+        assert first["checks"][0]["statuses"]["error"] == 1
+        assert _StubAirflowHandler.task_instance_requests == instances_after_first
+
+
 class TestRunGraph:
     """The master run's DAG, drawn by the dashboard from Airflow's own shape."""
 

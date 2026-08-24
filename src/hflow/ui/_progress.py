@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from hflow.format import CATALOG_FORMAT_VERSION
-from hflow.steps import Stage
+from hflow.steps import CheckStatus, Stage
 
 # A stage is stalled when nothing has completed for this many times its own
 # mean pace, floored so that a fast stage's first quiet second is not an alarm.
@@ -174,6 +174,75 @@ def query_stage_counts(
             last_completed_at=max(latest, completed_at) if latest else completed_at,
         )
     return tallies
+
+
+def query_check_breakdown(
+    catalog_root: Path,
+    uris: list[str],
+    window: StageWindow,
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Per-check outcomes for the episodes one stage finished in ``window``.
+
+    What the stage's verification actually found, check by check: how many
+    episodes passed, failed, were skipped, or crashed it, and what it cost.
+    An unreadable catalog or a stage that records no checks (sync writes
+    episode rows only) is an empty list, not an error.
+    """
+    if not _catalog_is_readable(catalog_root) or not uris:
+        return []
+    episodes_glob = _parquet_glob(catalog_root / "episodes")
+    checks_glob = _parquet_glob(catalog_root / "check_runs")
+    if episodes_glob is None or checks_glob is None:
+        return []
+
+    import duckdb
+
+    counted = ", ".join(
+        f"count(*) FILTER (c.status = '{status.value}') AS {status.value}_count"
+        for status in CheckStatus
+    )
+    connection = duckdb.connect()
+    try:
+        cursor = connection.execute(
+            f"""
+            SELECT c.check_name AS name,
+                   coalesce(bool_or(c.critical), false) AS critical,
+                   {counted},
+                   count(DISTINCT c.episode_id) AS episodes,
+                   avg(c.duration_s) FILTER (c.status != 'skipped') AS avg_duration_s
+            FROM read_parquet('{checks_glob}', union_by_name=true) c
+            JOIN read_parquet('{episodes_glob}', union_by_name=true) e
+              USING (episode_id, run_fingerprint)
+            WHERE e.source_uri IN (SELECT unnest(?::VARCHAR[]))
+              AND epoch(e.recorded_at) BETWEEN ? AND ?
+            GROUP BY c.check_name
+            ORDER BY c.check_name
+            """,
+            [uris, window.start.timestamp(), (window.end or now).timestamp()],
+        )
+        columns = [description[0] for description in cursor.description or []]
+        rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+    except (duckdb.Error, OSError):
+        return []
+    finally:
+        connection.close()
+
+    return [
+        {
+            "name": str(row["name"]),
+            "critical": bool(row["critical"]),
+            "statuses": {status.value: int(row[f"{status.value}_count"]) for status in CheckStatus},
+            "episodes": int(row["episodes"]),
+            "avg_duration_s": (
+                round(float(row["avg_duration_s"]), 3)
+                if row["avg_duration_s"] is not None
+                else None
+            ),
+        }
+        for row in rows
+    ]
 
 
 def _stage_for(recorded_at: float, bounds: dict[Stage, tuple[float, float]]) -> Stage | None:

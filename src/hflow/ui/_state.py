@@ -39,6 +39,8 @@ class UiState:
     # sub-run id and gate tally, so a long run stops re-asking Airflow about
     # the stages it already completed.
     stage_facts_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    # One finished run's check breakdown per stage, keyed (run_id, stage).
+    stage_checks_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
     def airflow_call(self, call: "Callable[[AirflowClient], _CallResult]") -> _CallResult:
         if self.airflow is None:

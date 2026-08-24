@@ -20,6 +20,7 @@ from hflow.ui._progress import (
     StageCounts,
     StageWindow,
     iso_timestamp,
+    query_check_breakdown,
     query_stage_counts,
     stage_progress,
     stage_windows_from_instances,
@@ -397,6 +398,46 @@ def _stage_cards(
             }
         )
     return cards
+
+
+def stage_checks_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    """What one stage's verification found, check by check."""
+    if state.bundle is None:
+        return _error(503, "no runtime bundle found", hint=_RUNTIME_DOWN_HINT)
+    stage_name = match.group("stage")
+    if stage_name not in _STAGE_VALUES:
+        return _error(404, f"no stage named {stage_name!r}")
+    stage = Stage(stage_name)
+    dag_id = state.bundle.dag_id
+    run_id = urllib.parse.unquote(match.group("run_id"))
+    cached = state.stage_checks_cache.get((run_id, stage.value))
+    if cached is not None:
+        return 200, cached
+    try:
+        run = state.airflow_call(lambda client: client.dag_run(dag_id, run_id))
+        instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
+    except AirflowClientError as error:
+        if error.status == 404:
+            return _error(404, f"no run {run_id!r} on {dag_id}")
+        return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
+    window = stage_windows_from_instances(instances).get(stage)
+    uris = _run_conf(run).get("uris")
+    checks: list[dict[str, Any]] = []
+    if window is not None and state.data_root is not None and isinstance(uris, list):
+        checks = query_check_breakdown(
+            state.data_root / "catalog",
+            [uri for uri in uris if isinstance(uri, str)],
+            window,
+            now=datetime.now(UTC),
+        )
+    payload = {"stage": stage.value, "checks": checks}
+    if str(run.get("state")) in _TERMINAL_RUN_STATES:
+        if len(state.stage_checks_cache) >= _STAGE_CACHE_LIMIT:
+            state.stage_checks_cache.clear()
+        state.stage_checks_cache[(run_id, stage.value)] = payload
+    return 200, payload
 
 
 def _window_duration_s(window: StageWindow | None) -> float | None:
