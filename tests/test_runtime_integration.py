@@ -194,8 +194,11 @@ def _assert_dashboard_observes_run(
 
     Verifies (1) the Airflow 3 UI run-page route the dashboard deep-links to
     answers 200, (2) ``order_by=-run_after`` is accepted, (3) the trigger
-    operator's ``trigger_run_id`` XCom names a real sub-DAG run, and (4) the
-    graph endpoints reproduce the rendered DAGs from Airflow's own structure.
+    operator's ``trigger_run_id`` XCom names a real sub-DAG run, (4) the graph
+    endpoints reproduce the rendered DAGs from Airflow's own structure, (5) the
+    stage cards' episode progress comes back out of the catalog this run wrote
+    and the gates' own tallies, and (6) the check breakdown counts the
+    pipeline's real checks over the run's episodes.
     """
     import json as json_module
     import threading
@@ -270,6 +273,37 @@ def _assert_dashboard_observes_run(
         assert [entry["map_index"] for entry in batch["mapped"]] == [0, 1]
         assert all(entry["state"] == "success" for entry in batch["mapped"])
         assert batch["mapped"][1]["airflow_url"].endswith("/mapped/1")
+
+        # (5) the stage cards: episode progress read back out of the catalog
+        # this very run wrote, plus each stage's own gate tally.
+        for stage_name, card in stages_by_name.items():
+            assert card["title"] and card["description"], stage_name
+            assert card["layer"] in {"automated", "model", "human"}, stage_name
+            assert card["state"] == "success", stage_name
+            assert card["total"] == 2, (stage_name, card)
+            progress = card["progress"]
+            assert progress is not None, stage_name
+            assert progress["done"] == 2, (stage_name, progress)
+            assert progress["errors"] == 0, (stage_name, progress)
+            assert progress["stalled"] is False, stage_name
+            assert progress["eta_s"] is None, stage_name  # nothing left to do
+
+        # (6) the check breakdown: the itest pipeline's own checks, counted
+        # over the two episodes. sync records episodes, not checks.
+        with urllib.request.urlopen(
+            f"{base_url}/api/pipelines/runs/{encoded_run_id}/stages/meta/checks", timeout=60
+        ) as response:
+            checks_payload = json_module.loads(response.read())
+        checks_by_name = {check["name"]: check for check in checks_payload["checks"]}
+        assert checks_by_name, checks_payload
+        for name, check in checks_by_name.items():
+            assert check["episodes"] == 2, (name, check)
+            assert sum(check["statuses"].values()) == 2, (name, check)
+            assert check["statuses"]["error"] == 0, (name, check)
+        with urllib.request.urlopen(
+            f"{base_url}/api/pipelines/runs/{encoded_run_id}/stages/sync/checks", timeout=60
+        ) as response:
+            assert json_module.loads(response.read())["checks"] == []
     finally:
         server.shutdown()
         server.server_close()

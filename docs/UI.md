@@ -27,16 +27,48 @@ run's own task instances. A stage disabled by the run profile shows as
 skipped; a stage that never ran because an earlier one failed shows as
 pending, not failed.
 
-Opening a run draws its DAG: the run's own tasks, laid out top to bottom with
-live per-task state, edges included -- the dashboard reads the shape from
-Airflow, so the graph follows whatever your bundle rendered. Clicking a task
-opens a details panel with its state, timings, attempt count, the task's doc
-line, and a link to that task's logs in Airflow. A stage's trigger task
-stands for a whole stage, so its node drills into that stage's own run
-(`plan`, the mapped `process_batch` instances, the budget gate) without
-leaving the dashboard; a mapped task is one node with a per-batch breakdown
-in the panel. Run pages poll every few seconds and stop once the run is
-finished.
+Opening a run shows its pipeline as stages, numbered in the order they run.
+Each card carries the stage's title and purpose, which verification family
+vouches for its output (automated checks, model verification, human review),
+its state, and how many of the run's episodes it has finished. While a stage
+is running the card adds its pace in episodes per minute, an estimate of the
+time left, and -- when nothing has finished for well past the stage's own pace
+-- a stalled warning, which is where a run bottlenecks in practice. A stage
+the profile disabled shows as skipped, one waiting its turn names the stage
+ahead of it, and once a run has ended the stages it never reached say so
+rather than claiming to be waiting.
+
+**Where the counts come from.** Every episode a stage finishes appends a row
+to the catalog the pipeline already writes, so progress is read from that
+Parquet -- no extra instrumentation, and no state of the dashboard's own.
+Appends are attributed to a stage by the run's URI set inside that stage's own
+window, which is exact for one runtime watching one run: concurrent runs over
+overlapping episodes, or a `hflow test --record` in the same minutes, would
+cross-attribute. Two honest limits follow. A run that replays work already
+recorded appends nothing (the append is idempotent), so a running stage falls
+back to counting whole finished batches -- coarser, and its pace estimate runs
+pessimistic, but it does not read as stuck; and once a stage ends its own
+budget gate's tally is preferred, which is why a replayed stage's count jumps
+to complete when it finishes. Serving the dashboard without `--data-root`, or
+against a bucket data root, leaves the counts unavailable and the rest of the
+card intact.
+
+Clicking a stage opens that stage: the same card, then what its checks found
+-- per check, how many episodes passed, failed, were skipped or crashed it,
+whether it is critical, and its average cost -- and then the tasks that did
+the work (`plan`, the mapped `process_batch` instances, the budget gate).
+Clicking a task opens a details panel with its state, timings, attempt count,
+the task's doc line, and a link to that task's logs in Airflow; a mapped task
+is one node with a per-batch breakdown in the panel. The sync stage records
+episodes rather than checks, so its breakdown is empty by design.
+
+The master DAG's own tasks are still drawable, a level down: the **Task graph**
+link on the run page (`#/pipelines/run?id=<run>&graph=tasks`) lays them out top
+to bottom with live state, for when the orchestration itself is the suspect
+rather than the data. The dashboard reads that shape from Airflow, so it
+follows whatever your bundle rendered.
+
+Run pages poll every few seconds and stop once the run is finished.
 
 Logs, retries, re-runs, and everything else task-level stay Airflow's. The
 toolbar's credentials popover serves the admin username and password from the
