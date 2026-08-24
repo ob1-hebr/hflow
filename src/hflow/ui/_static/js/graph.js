@@ -7,14 +7,16 @@
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
-const NODE_W = 224;
+const NODE_W = 296;
 const NODE_H = 46;
 const H_GAP = 28;
 const V_GAP = 34;
 const PAD = 20;
-// The label is 12.5px mono (~7.5px per character) in NODE_W minus the dot
-// gutter, so it stays inside its box without measuring text.
-const LABEL_MAX = 23;
+// The label is 12.5px mono (~7.5px per character), so these are the character
+// counts that fit inside NODE_W without measuring text -- wide enough for
+// every task name the templates render, with room for the drill-in chevron.
+const LABEL_MAX = 34;
+const LABEL_MAX_WITH_DRILL = 31;
 
 function svgEl(tag, attrs, ...children) {
   const el = document.createElementNS(SVG_NS, tag);
@@ -129,9 +131,9 @@ function edgePath(edge, { placed, layer, gutter }) {
 
 // --- nodes --------------------------------------------------------------------
 
-function truncate(text) {
+function truncate(text, max) {
   const value = String(text ?? '');
-  return value.length > LABEL_MAX ? `${value.slice(0, LABEL_MAX - 1)}…` : value;
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 function subtitleFor(node) {
@@ -149,6 +151,8 @@ function nodeSignature(node) {
 // --- the graph ---------------------------------------------------------------
 
 export function createDagGraph({ onSelect, onDrillIn } = {}) {
+  const labelMax = (node) =>
+    node.stage && onDrillIn ? LABEL_MAX_WITH_DRILL : LABEL_MAX;
   const svg = svgEl('svg', { class: 'dag-graph' });
   const wrap = document.createElement('div');
   wrap.className = 'graph-wrap';
@@ -185,7 +189,7 @@ export function createDagGraph({ onSelect, onDrillIn } = {}) {
     group.append(
       svgEl('rect', { class: 'dag-node__box', width: NODE_W, height: NODE_H, rx: 7 }),
       svgEl('circle', { class: 'dag-node__dot', cx: 17, cy: NODE_H / 2, r: 4 }),
-      svgEl('text', { class: 'dag-node__label', x: 31, y: 20 }, truncate(node.label)),
+      svgEl('text', { class: 'dag-node__label', x: 31, y: 20 }, truncate(node.label, labelMax(node))),
       svgEl('text', { class: 'dag-node__sub', x: 31, y: 34 }, subtitleFor(node)),
       svgEl('title', null, `${node.label} -- ${node.state}`),
     );
@@ -243,7 +247,7 @@ export function createDagGraph({ onSelect, onDrillIn } = {}) {
       entry.group.setAttribute('class', classFor(node));
       if (entry.signature === signature) continue;
       entry.signature = signature;
-      entry.group.querySelector('.dag-node__label').textContent = truncate(node.label);
+      entry.group.querySelector('.dag-node__label').textContent = truncate(node.label, labelMax(node));
       entry.group.querySelector('.dag-node__sub').textContent = subtitleFor(node);
       entry.group.querySelector('title').textContent = `${node.label} -- ${node.state}`;
     }

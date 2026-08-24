@@ -176,6 +176,13 @@ tr:hover .row-actions, .row-actions:focus-within { opacity: 1; }
 .status--success .status__label { color: var(--dim); }
 .status--failed .icon { color: var(--error); }
 .status--failed .status__label { color: var(--error); }
+/* Task-level states, shown on the run page's graph and details panel. */
+.status--pending .status__dot { box-shadow: inset 0 0 0 1.5px var(--border-strong); }
+.status--skipped .status__dot { background: var(--border); }
+.status--upstream_failed .status__dot { background: var(--warn); }
+.status--upstream_failed .status__label { color: var(--warn); }
+.status--pending .status__label,
+.status--skipped .status__label { color: var(--faint); }
 @keyframes pulse { 50% { opacity: .35; } }
 
 /* --- stage strip ------------------------------------------------------------- */

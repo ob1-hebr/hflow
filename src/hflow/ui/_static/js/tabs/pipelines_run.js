@@ -1,6 +1,10 @@
 // Run page: one run's DAG with live task state, so following a run never
 // means going to find it in Airflow's own UI. Polls every 3s while the run is
 // active and stops once it finishes -- a run that ended cannot change again.
+//
+// The same page renders a stage's own run: the master's trigger nodes drill
+// into it, and the backend resolves which sub-run that was, so the only run
+// id this module ever holds is the master's.
 
 import { api } from '../api.js';
 import { Poller } from '../app.js';
@@ -15,6 +19,7 @@ const TERMINAL_RUN_STATES = new Set(['success', 'failed']);
 let container = null;
 let poller = null;
 let runId = null;
+let stage = null;         // the stage being drilled into, null on the master page
 let data;                 // last successful graph payload
 let mode = null;          // 'graph' | 'down' | 'missing' | 'no-run'
 let graph = null;
@@ -24,13 +29,17 @@ let panelSlot = null;
 let panelSignature = null;
 let selectedId = null;
 
-export function runHash(id) {
-  return `#/pipelines/run?id=${encodeURIComponent(id)}`;
+export function runHash(id, stageName = null) {
+  // Run ids carry '+' and ':', so the query is always built with
+  // encodeURIComponent -- never by hand.
+  const suffix = stageName ? `&stage=${encodeURIComponent(stageName)}` : '';
+  return `#/pipelines/run?id=${encodeURIComponent(id)}${suffix}`;
 }
 
 export function mount(section, params) {
   container = section;
   runId = params.id || null;
+  stage = params.stage || null;
   data = undefined;
   mode = null;
   graph = null;
@@ -58,13 +67,19 @@ function onKeydown(event) {
   if (event.key === 'Escape' && selectedId) selectNode(null);
 }
 
+function graphPath(id) {
+  const base = `/api/pipelines/runs/${encodeURIComponent(id)}`;
+  return stage ? `${base}/stages/${encodeURIComponent(stage)}/graph` : `${base}/graph`;
+}
+
 async function load() {
-  const requested = runId;
+  const [requested, requestedStage] = [runId, stage];
+  const stale = () => requested !== runId || requestedStage !== stage || container === null;
   let payload;
   try {
-    payload = await api(`/api/pipelines/runs/${encodeURIComponent(requested)}/graph`);
+    payload = await api(graphPath(requested));
   } catch (err) {
-    if (requested !== runId || container === null) return; // navigated away
+    if (stale()) return; // navigated away mid-request
     if (err.status === 404) {
       poller.stop(); // a run id that is absent now will not appear later
       renderMessage('missing', {
@@ -81,10 +96,17 @@ async function load() {
     }
     return; // any other failure keeps the last render; the banner reports it
   }
-  if (requested !== runId || container === null) return;
+  if (stale()) return;
   data = payload;
   render();
-  if (TERMINAL_RUN_STATES.has(data.run.state)) poller.stop();
+  if (finished()) poller.stop();
+}
+
+function finished() {
+  if (!stage) return TERMINAL_RUN_STATES.has(data.run.state);
+  // A stage that never started still settles once its master run does.
+  return TERMINAL_RUN_STATES.has(data.master_state)
+    && (data.run === null || TERMINAL_RUN_STATES.has(data.run.state));
 }
 
 // --- rendering ---------------------------------------------------------------
@@ -92,7 +114,11 @@ async function load() {
 function crumbs() {
   return h('div', { class: 'browse-crumbs' },
     h('a', { class: 'crumb-back', href: '#/pipelines' }, '‹ Runs'),
-    h('span', { class: 'crumb crumb--current', title: runId }, runId));
+    stage
+      ? h('a', { class: 'crumb', href: runHash(runId), title: runId }, runId)
+      : h('span', { class: 'crumb crumb--current', title: runId }, runId),
+    stage ? h('span', { class: 'crumb-sep' }, '/') : null,
+    stage ? h('span', { class: 'crumb crumb--current' }, stage) : null);
 }
 
 function renderMessage(nextMode, { title, body, command }) {
@@ -105,18 +131,22 @@ function renderMessage(nextMode, { title, body, command }) {
 function render() {
   if (mode !== 'graph') {
     mode = 'graph';
-    graph = createDagGraph({ onSelect: selectNode });
-    headerEl = runHeader(data.run);
-    headerSignature = runSignature(data.run);
+    graph = createDagGraph({
+      onSelect: selectNode,
+      // Only the master's trigger nodes carry a stage, so only they drill in.
+      onDrillIn: stage ? null : (stageName) => { location.hash = runHash(runId, stageName); },
+    });
+    headerEl = header();
+    headerSignature = runSignature(data);
     panelSlot = h('div', { class: 'panel-slot' });
     panelSignature = null;
     container.replaceChildren(
       crumbs(),
       headerEl,
       h('div', { class: 'run-layout' }, graph.el, panelSlot));
-  } else if (runSignature(data.run) !== headerSignature) {
-    headerSignature = runSignature(data.run);
-    const next = runHeader(data.run);
+  } else if (runSignature(data) !== headerSignature) {
+    headerSignature = runSignature(data);
+    const next = header();
     headerEl.replaceWith(next);
     headerEl = next;
   }
@@ -125,8 +155,17 @@ function render() {
   renderPanel();
 }
 
-function runSignature(run) {
+function runSignature({ run, master_state: masterState }) {
+  if (run === null) return `none|${masterState}`;
   return [run.state, run.start_date, run.duration_s, JSON.stringify(run.stages)].join('|');
+}
+
+function header() {
+  if (data.run !== null) return runHeader(data.run);
+  return h('div', { class: 'run-header' },
+    statusDot('pending'),
+    h('span', { class: 'run-header__fact' },
+      `The ${stage} stage has not started -- these are the tasks it will run.`));
 }
 
 function runHeader(run) {
@@ -206,6 +245,10 @@ function taskPanel(node) {
     panelRow('Duration', taskDuration(node)),
     panelRow('Attempt', node.try_number == null ? '—' : String(node.try_number)),
     mappedBreakdown(node),
+    node.stage
+      ? h('a', { class: 'detail-panel__link', href: runHash(runId, node.stage) },
+          `View the ${node.stage} stage`, icon('chevron'))
+      : null,
     node.airflow_url
       ? h('a', {
           class: 'detail-panel__link', href: node.airflow_url,
