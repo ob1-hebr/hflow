@@ -205,7 +205,9 @@ function header(run) {
       : null,
     h('span', { class: 'run-header__fact' }, runDuration(run)),
     h('span', { class: 'run-header__spacer' }),
-    h('a', { class: 'text-link', href: runHash(runId, { graph: 'tasks' }) }, 'Task graph'),
+    view === 'tasks'
+      ? h('a', { class: 'text-link', href: runHash(runId) }, 'Stages')
+      : h('a', { class: 'text-link', href: runHash(runId, { graph: 'tasks' }) }, 'Task graph'),
     h('a', {
       class: 'icon-button', href: run.airflow_url, target: '_blank',
       rel: 'noopener', title: 'Open in Airflow',
