@@ -122,10 +122,11 @@ collection rig or upload script can call the same endpoint directly, no CLI
 required (`"mode": "online"` is the `--online` lane).
 
 **3. Watch it.** `hflow ui` (see [UI.md](./UI.md)) shows runs live with
-per-stage status and serves the Airflow credentials. For per-task status,
-logs, retries, and re-runs, follow a run's deep link into Airflow's own
-screens, exposed on localhost -- or open the printed URL and log in with the
-printed credentials directly.
+per-stage status, and opening a run draws its DAG with live per-task state --
+including a drill-in to each stage's own run. For logs, retries, and re-runs,
+follow a task's link into Airflow's own screens, exposed on localhost -- or
+open the printed URL and log in with the printed credentials directly (the
+dashboard serves them too).
 
 **4. `curate`.** Every processed episode appended rows to the Parquet catalog
 under the data root, the same files whether the run came from `app.test(...,

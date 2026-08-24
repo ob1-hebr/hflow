@@ -27,12 +27,22 @@ run's own task instances. A stage disabled by the run profile shows as
 skipped; a stage that never ran because an earlier one failed shows as
 pending, not failed.
 
-The dashboard deliberately does not replace step-level observability: each
-run deep-links into Airflow's own UI for tasks, logs, retries, and re-runs.
-The toolbar's credentials popover serves the admin username and password from
-the bundle `.env`, so nothing needs to be fished out of terminal scrollback.
-The dashboard triggers nothing; runs start from `hflow ingest` or the REST
-API as before.
+Opening a run draws its DAG: the run's own tasks, laid out top to bottom with
+live per-task state, edges included -- the dashboard reads the shape from
+Airflow, so the graph follows whatever your bundle rendered. Clicking a task
+opens a details panel with its state, timings, attempt count, the task's doc
+line, and a link to that task's logs in Airflow. A stage's trigger task
+stands for a whole stage, so its node drills into that stage's own run
+(`plan`, the mapped `process_batch` instances, the budget gate) without
+leaving the dashboard; a mapped task is one node with a per-batch breakdown
+in the panel. Run pages poll every few seconds and stop once the run is
+finished.
+
+Logs, retries, re-runs, and everything else task-level stay Airflow's. The
+toolbar's credentials popover serves the admin username and password from the
+bundle `.env`, so nothing needs to be fished out of terminal scrollback. The
+dashboard triggers nothing; runs start from `hflow ingest` or the REST API as
+before.
 
 ## Storage
 

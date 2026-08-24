@@ -193,8 +193,9 @@ def _assert_dashboard_observes_run(
     """The UI endpoints against REAL Airflow: the flagged unknowns in one place.
 
     Verifies (1) the Airflow 3 UI run-page route the dashboard deep-links to
-    answers 200, (2) ``order_by=-run_after`` is accepted, and (3) the trigger
-    operator's ``trigger_run_id`` XCom names a real sub-DAG run.
+    answers 200, (2) ``order_by=-run_after`` is accepted, (3) the trigger
+    operator's ``trigger_run_id`` XCom names a real sub-DAG run, and (4) the
+    graph endpoints reproduce the rendered DAGs from Airflow's own structure.
     """
     import json as json_module
     import threading
@@ -237,6 +238,38 @@ def _assert_dashboard_observes_run(
         sync_run_id = stages_by_name["sync"]["sub_run_id"]
         assert sync_run_id, detail_payload
         assert client.dag_run("itest_pipeline_sync", sync_run_id).get("state") == "success"
+
+        # (4) the master graph: the shape the templates render, from the API
+        with urllib.request.urlopen(
+            f"{base_url}/api/pipelines/runs/{encoded_run_id}/graph", timeout=60
+        ) as response:
+            graph_payload = json_module.loads(response.read())
+        nodes_by_id = {node["id"]: node for node in graph_payload["nodes"]}
+        assert len(nodes_by_id) == 9, sorted(nodes_by_id)
+        assert len(graph_payload["edges"]) == 11, graph_payload["edges"]
+        assert {node["state"] for node in graph_payload["nodes"]} == {"success"}
+        assert all(node["doc"] and node["operator"] for node in graph_payload["nodes"])
+        assert nodes_by_id["trigger_sync"]["stage"] == "sync"
+        # The task page the details panel links to for logs.
+        task_url = nodes_by_id["trigger_sync"]["airflow_url"]
+        with urllib.request.urlopen(task_url, timeout=30) as response:
+            assert response.status == 200
+
+        # The stage graph resolves the same sub-run and folds its mapped batches.
+        with urllib.request.urlopen(
+            f"{base_url}/api/pipelines/runs/{encoded_run_id}/stages/sync/graph", timeout=60
+        ) as response:
+            stage_payload = json_module.loads(response.read())
+        assert stage_payload["run"]["run_id"] == sync_run_id
+        assert stage_payload["master_state"] == "success"
+        stage_nodes = {node["id"]: node for node in stage_payload["nodes"]}
+        assert set(stage_nodes) == {"plan", "process_batch", "error_budget_gate"}
+        batch = stage_nodes["process_batch"]
+        assert batch["is_mapped"] and batch["state"] == "success"
+        # Two episodes plan into two batches, each its own mapped instance.
+        assert [entry["map_index"] for entry in batch["mapped"]] == [0, 1]
+        assert all(entry["state"] == "success" for entry in batch["mapped"])
+        assert batch["mapped"][1]["airflow_url"].endswith("/mapped/1")
     finally:
         server.shutdown()
         server.server_close()

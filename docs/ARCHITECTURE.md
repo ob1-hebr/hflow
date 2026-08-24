@@ -139,7 +139,7 @@ Airflow cannot be a normal pip dependency: its own maintainers state unconstrain
 
 **Dev loop:** `app.test(episode)` runs the entire pipeline in-process on one episode: no Docker, no scheduler, no Airflow import at all (a plain Python runner with the same gate semantics, wrapping the `app.process()` operation the DAG maps over). Iterate on a check in seconds; `app.run()` when it works.
 
-**Observability splits by altitude.** The dashboard (`hflow ui`, see [UI.md](./UI.md)) is the pipeline-level view: live runs, per-stage status, catalog stats. Step-level observability stays Airflow's own UI, exposed on localhost in Compose mode -- the blog cites "the status of each step is clearly observed from the DAG" as a benefit, and run rows deep-link into it. The SDK also adds plain-language diagnostics for embedder-specific traps (`hflow status`).
+**Observability splits by altitude.** The dashboard (`hflow ui`, see [UI.md](./UI.md)) covers everything down to the task: live runs, per-stage status, catalog stats, and each run's DAG with per-task state, drawn from Airflow's own structure and task-instance APIs -- the blog cites "the status of each step is clearly observed from the DAG" as a benefit, and this is that view without the detour. Below the task, Airflow's own UI remains the tool -- logs, retries, re-runs, exposed on localhost in Compose mode and linked from every task. The SDK also adds plain-language diagnostics for embedder-specific traps (`hflow status`).
 
 ### Data passing
 
