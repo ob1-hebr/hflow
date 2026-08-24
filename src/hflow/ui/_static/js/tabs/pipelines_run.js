@@ -21,7 +21,7 @@ let poller = null;
 let runId = null;
 let stage = null;         // the stage being drilled into, null on the master page
 let data;                 // last successful graph payload
-let mode = null;          // 'graph' | 'down' | 'missing' | 'no-run'
+let mode = null;          // 'pending' | 'graph' | 'down' | 'missing' | 'no-run'
 let graph = null;
 let headerEl = null;
 let headerSignature = null;
@@ -53,6 +53,10 @@ export function mount(section, params) {
     });
     return;
   }
+  // Paint this page's own frame right away: the runs table must not linger
+  // on screen while the first graph loads.
+  mode = 'pending';
+  container.replaceChildren(crumbs(), h('div', { class: 'block-pending' }, 'Loading'));
   if (!poller) poller = new Poller(load, POLL_MS);
   poller.start();
 }
