@@ -165,10 +165,14 @@ def _run_duration_s(run: dict[str, Any]) -> float | None:
     return round((ended - started).total_seconds(), 1)
 
 
-def _run_summary(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, Any]:
-    assert state.bundle is not None
+def _run_conf(run: dict[str, Any]) -> dict[str, Any]:
     raw_conf = run.get("conf")
-    conf: dict[str, Any] = raw_conf if isinstance(raw_conf, dict) else {}
+    return raw_conf if isinstance(raw_conf, dict) else {}
+
+
+def _run_header(base_url: str, dag_id: str, run: dict[str, Any]) -> dict[str, Any]:
+    """The facts every run page shows; a stage sub-run has no profile or stages."""
+    conf = _run_conf(run)
     uris = conf.get("uris")
     run_id = str(run.get("dag_run_id"))
     return {
@@ -178,10 +182,17 @@ def _run_summary(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, 
         "start_date": run.get("start_date"),
         "end_date": run.get("end_date"),
         "duration_s": _run_duration_s(run),
-        "profile": conf.get("profile"),
         "mode": conf.get("mode"),
         "episode_count": len(uris) if isinstance(uris, list) else None,
-        "airflow_url": _airflow_run_url(state.bundle.api_base_url, dag_id, run_id),
+        "airflow_url": _airflow_run_url(base_url, dag_id, run_id),
+    }
+
+
+def _run_summary(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, Any]:
+    assert state.bundle is not None
+    return {
+        **_run_header(state.bundle.api_base_url, dag_id, run),
+        "profile": _run_conf(run).get("profile"),
         "stages": _stages_for_run(state, dag_id, run),
     }
 
@@ -273,6 +284,277 @@ def run_detail_handler(
             }
         )
     return 200, {"run": summary, "stages": stages}
+
+
+# ---------------------------------------------------------------------------
+# Run graphs
+#
+# The dashboard draws each run's DAG itself, so these endpoints pair the DAG's
+# shape (task definitions, which carry the edges) with the run's task
+# instances. Structure comes from Airflow rather than the templates: the
+# graph then follows whatever a bundle actually rendered.
+
+
+def _airflow_task_url(
+    base_url: str, dag_id: str, dag_run_id: str, task_id: str, map_index: int | None = None
+) -> str:
+    """The Airflow page for one task instance -- where its logs live."""
+    run_url = _airflow_run_url(base_url, dag_id, dag_run_id)
+    url = f"{run_url}/tasks/{urllib.parse.quote(task_id, safe='')}"
+    return url if map_index is None else f"{url}/mapped/{map_index}"
+
+
+# Task nodes extend the stage vocabulary with ``upstream_failed``: at task
+# altitude that is a real outcome worth showing (Airflow colors it too), where
+# a whole stage that never ran reads better as "pending".
+_TASK_STATE_TO_NODE_STATE = {
+    **_TRIGGER_STATE_TO_STAGE_STATE,
+    "skipped": "skipped",
+    "removed": "skipped",
+    "upstream_failed": "upstream_failed",
+}
+_TERMINAL_NODE_STATES = frozenset({"success", "failed", "skipped", "upstream_failed"})
+_STAGE_VALUES = frozenset(stage.value for stage in Stage)
+
+
+def _instance_facts(instance: dict[str, Any]) -> dict[str, Any]:
+    """One task instance's state and timing; an absent instance is pending."""
+    duration = instance.get("duration")
+    return {
+        "state": _TASK_STATE_TO_NODE_STATE.get(str(instance.get("state") or ""), "pending"),
+        "airflow_state": instance.get("state"),
+        "start_date": instance.get("start_date"),
+        "end_date": instance.get("end_date"),
+        "duration_s": round(float(duration), 1) if isinstance(duration, int | float) else None,
+        "try_number": instance.get("try_number"),
+    }
+
+
+def _folded_mapped_facts(mapped: list[dict[str, Any]]) -> dict[str, Any]:
+    """One node's facts from a mapped task's per-index instances.
+
+    Timing spans the whole fan-out (first start to last end), which is what
+    the batch actually cost; per-index timing stays in ``mapped``.
+    """
+    states = {entry["state"] for entry in mapped}
+    if "failed" in states:
+        state = "failed"
+    elif states == {"pending"}:
+        state = "pending"
+    elif not states <= _TERMINAL_NODE_STATES:
+        state = "running"
+    elif "upstream_failed" in states:
+        state = "upstream_failed"
+    elif "success" in states:
+        state = "success"
+    else:
+        state = "skipped"
+    starts = [entry["start_date"] for entry in mapped if entry["start_date"]]
+    ends = [entry["end_date"] for entry in mapped if entry["end_date"]]
+    start = min(starts) if starts else None
+    end = max(ends) if len(ends) == len(mapped) else None
+    return {
+        "state": state,
+        "airflow_state": None,
+        "start_date": start,
+        "end_date": end,
+        "duration_s": (
+            _run_duration_s({"start_date": start, "end_date": end})
+            if start is not None and end is not None
+            else None
+        ),
+        "try_number": None,
+    }
+
+
+def _stage_of_trigger(task_id: str) -> str | None:
+    """The stage a master ``trigger_<stage>`` task drives, for drill-in."""
+    stage_name = task_id.removeprefix("trigger_")
+    return stage_name if stage_name != task_id and stage_name in _STAGE_VALUES else None
+
+
+def _graph_nodes(
+    tasks: list[dict[str, Any]],
+    instances: list[dict[str, Any]],
+    *,
+    base_url: str,
+    dag_id: str,
+    run_id: str | None,
+) -> list[dict[str, Any]]:
+    """One node per task definition, carrying this run's state for it."""
+    by_task_id: dict[str, list[dict[str, Any]]] = {}
+    for instance in instances:
+        by_task_id.setdefault(str(instance.get("task_id")), []).append(instance)
+
+    nodes: list[dict[str, Any]] = []
+    for task in tasks:
+        task_id = str(task.get("task_id"))
+        mine = by_task_id.get(task_id, [])
+        # A mapped task fans out to one instance per index; anything before
+        # expansion (or a skipped plan) leaves a single index-less instance.
+        expanded = sorted(
+            (entry for entry in mine if int(entry.get("map_index", -1)) >= 0),
+            key=lambda entry: int(entry["map_index"]),
+        )
+        mapped: list[dict[str, Any]] | None
+        if expanded:
+            mapped = [
+                {
+                    **_instance_facts(entry),
+                    "map_index": int(entry["map_index"]),
+                    "rendered_map_index": entry.get("rendered_map_index"),
+                    "airflow_url": (
+                        _airflow_task_url(
+                            base_url, dag_id, run_id, task_id, int(entry["map_index"])
+                        )
+                        if run_id is not None
+                        else None
+                    ),
+                }
+                for entry in expanded
+            ]
+            facts = _folded_mapped_facts(mapped)
+        else:
+            mapped = [] if task.get("is_mapped") else None
+            facts = _instance_facts(mine[0] if mine else {})
+        nodes.append(
+            {
+                "id": task_id,
+                "label": task.get("task_display_name") or task_id,
+                "operator": task.get("operator_name"),
+                "doc": task.get("doc_md"),
+                "is_mapped": bool(task.get("is_mapped")),
+                **facts,
+                "airflow_url": (
+                    _airflow_task_url(base_url, dag_id, run_id, task_id)
+                    if run_id is not None
+                    else None
+                ),
+                "mapped": mapped,
+                "stage": _stage_of_trigger(task_id),
+            }
+        )
+    return nodes
+
+
+def _graph_edges(tasks: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Edges as the DAG declares them, including implicit XCom dependencies."""
+    known = {str(task.get("task_id")) for task in tasks}
+    edges = {
+        (str(task.get("task_id")), str(target))
+        for task in tasks
+        for target in task.get("downstream_task_ids") or []
+        if str(target) in known
+    }
+    return [{"source": source, "target": target} for source, target in sorted(edges)]
+
+
+def _dag_structure(
+    state: UiState, dag_id: str, instances: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The DAG's task definitions, fetched once per dag_id.
+
+    A shape only changes when the bundle is re-rendered, which the running
+    dashboard learns about from task instances naming a task the cached
+    structure lacks -- then it refetches.
+    """
+    cached = state.dag_tasks_cache.get(dag_id)
+    if cached is not None:
+        known = {str(task.get("task_id")) for task in cached}
+        if all(str(instance.get("task_id")) in known for instance in instances):
+            return cached
+    tasks = state.airflow_call(lambda client: client.dag_tasks(dag_id))
+    state.dag_tasks_cache[dag_id] = tasks
+    return tasks
+
+
+def run_graph_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    if state.bundle is None:
+        return _error(503, "no runtime bundle found", hint=_RUNTIME_DOWN_HINT)
+    dag_id = state.bundle.dag_id
+    run_id = urllib.parse.unquote(match.group("run_id"))
+    try:
+        run = state.airflow_call(lambda client: client.dag_run(dag_id, run_id))
+        instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
+        tasks = _dag_structure(state, dag_id, instances)
+    except AirflowClientError as error:
+        if error.status == 404:
+            return _error(404, f"no run {run_id!r} on {dag_id}")
+        return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
+    return 200, {
+        "dag_id": dag_id,
+        "run": _run_summary(state, dag_id, run),
+        "nodes": _graph_nodes(
+            tasks,
+            instances,
+            base_url=state.bundle.api_base_url,
+            dag_id=dag_id,
+            run_id=run_id,
+        ),
+        "edges": _graph_edges(tasks),
+    }
+
+
+def _stage_run_and_instances(
+    state: UiState, sub_dag_id: str, sub_run_id: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """The stage run and its task instances; ``None`` once it is gone."""
+    try:
+        run = state.airflow_call(lambda client: client.dag_run(sub_dag_id, sub_run_id))
+    except AirflowClientError as error:
+        if error.status == 404:
+            return None
+        raise
+    instances = state.airflow_call(lambda client: client.task_instances(sub_dag_id, sub_run_id))
+    return run, instances
+
+
+def stage_graph_handler(
+    state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
+) -> JsonResponse:
+    if state.bundle is None:
+        return _error(503, "no runtime bundle found", hint=_RUNTIME_DOWN_HINT)
+    stage_name = match.group("stage")
+    if stage_name not in _STAGE_VALUES:
+        return _error(404, f"no stage named {stage_name!r}")
+    stage = Stage(stage_name)
+    dag_id = state.bundle.dag_id
+    base_url = state.bundle.api_base_url
+    run_id = urllib.parse.unquote(match.group("run_id"))
+    sub_dag_id = dict(zip(Stage, bundle_dag_ids(dag_id)[1:], strict=True))[stage]
+    try:
+        master = state.airflow_call(lambda client: client.dag_run(dag_id, run_id))
+        sub_run_id = _sub_run_id_from_xcom(state, dag_id, run_id, stage)
+        resolved = (
+            _stage_run_and_instances(state, sub_dag_id, sub_run_id)
+            if sub_run_id is not None
+            else None
+        )
+        sub_run = resolved[0] if resolved is not None else None
+        instances = resolved[1] if resolved is not None else []
+        # The shape is worth showing before the stage starts, so an
+        # unresolved sub-run still renders -- every node pending.
+        tasks = _dag_structure(state, sub_dag_id, instances)
+    except AirflowClientError as error:
+        if error.status == 404:
+            return _error(404, f"no run {run_id!r} on {dag_id}")
+        return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
+    return 200, {
+        "stage": stage.value,
+        "dag_id": sub_dag_id,
+        "master_state": master.get("state"),
+        "run": _run_header(base_url, sub_dag_id, sub_run) if sub_run is not None else None,
+        "nodes": _graph_nodes(
+            tasks,
+            instances,
+            base_url=base_url,
+            dag_id=sub_dag_id,
+            run_id=str(sub_run["dag_run_id"]) if sub_run is not None else None,
+        ),
+        "edges": _graph_edges(tasks),
+    }
 
 
 # ---------------------------------------------------------------------------

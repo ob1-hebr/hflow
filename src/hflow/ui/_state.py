@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from hflow.runtime import AirflowClient, BundlePaths, client_for_bundle, load_bundle
 
@@ -29,6 +29,10 @@ class UiState:
     # Per-stage states of finished runs never change again; caching them keeps
     # the runs-list poll at one Airflow call plus one per still-active run.
     stage_cache: dict[str, dict[str, str]] = field(default_factory=dict)
+    # A DAG's shape is fixed by its render, so the graph pages fetch it once
+    # per dag_id; a re-render mid-session is caught by the membership guard in
+    # :func:`hflow.ui._handlers._dag_structure`.
+    dag_tasks_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def airflow_call(self, call: "Callable[[AirflowClient], _CallResult]") -> _CallResult:
         if self.airflow is None:
