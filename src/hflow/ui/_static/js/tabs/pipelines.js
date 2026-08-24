@@ -2,6 +2,7 @@
 
 import { api } from '../api.js';
 import { Poller } from '../app.js';
+import * as runPage from './pipelines_run.js';
 import {
   h, icon, statusDot, stageStrip, stageStripDemo, chip, copyButton, callout,
   commandBlock, emptyState, loadingRow, popover, relTime, duration, syncRows,
@@ -18,7 +19,13 @@ let credentialsButton = null;
 let body = null;
 let tbody = null;
 
-export function mount(section, _params) {
+export function mount(section, params) {
+  // One run's page lives under this tab: the router re-mounts on every hash
+  // change, so switching between the list and a run is a plain branch.
+  if (params.view === 'run') {
+    runPage.mount(section, params);
+    return;
+  }
   container = section;
   if (!poller) poller = new Poller(load, POLL_MS);
   render();
@@ -26,7 +33,8 @@ export function mount(section, _params) {
 }
 
 export function unmount() {
-  poller.stop();
+  runPage.unmount();
+  if (poller) poller.stop();
 }
 
 async function load() {
@@ -57,7 +65,7 @@ function ensureShell() {
   renderedMode = null;
   container.replaceChildren(
     h('div', { class: 'tab-toolbar' },
-      h('p', { class: 'subtitle' }, 'Runs of the ingest DAG. Open a run in Airflow for tasks, logs, and retries.'),
+      h('p', { class: 'subtitle' }, 'Runs of the ingest DAG. Open a run to follow its pipeline task by task.'),
       credentialsButton),
     body);
 }
@@ -84,7 +92,7 @@ function render() {
         trailing: commandBlock('hflow ingest <episode-uri>'),
       }));
     } else {
-      tbody = h('tbody', null, mode === 'loading' ? loadingRow(9) : null);
+      tbody = h('tbody', null, mode === 'loading' ? loadingRow(10) : null);
       body.replaceChildren(runsTable(tbody));
     }
   }
@@ -104,7 +112,8 @@ function runsTable(tbodyEl) {
       h('th', { class: 'col-profile' }, 'Profile'),
       h('th', { class: 'col-started' }, 'Started'),
       h('th', { class: 'col-duration th-num' }, 'Duration'),
-      h('th', { class: 'col-airflow', 'aria-label': 'Airflow' }))),
+      h('th', { class: 'col-airflow', 'aria-label': 'Airflow' }),
+      h('th', { class: 'col-chevron', 'aria-label': 'Pipeline' }))),
     tbodyEl);
 }
 
@@ -133,10 +142,19 @@ const CELLS = [
   { signature: (r) => `${r.state}|${r.start_date}|${r.run_after}`, build: buildStartedCell },
   { signature: (r) => `${r.state}|${r.start_date}|${r.duration_s}`, build: buildDurationCell },
   { signature: (r) => String(r.airflow_url), build: buildAirflowCell },
+  { signature: (r) => r.run_id, build: buildChevronCell },
 ];
 
 function createRow(run) {
-  const tr = h('tr', { class: run.state === 'running' ? 'row--running' : null });
+  const tr = h('tr', {
+    class: `row-clickable${run.state === 'running' ? ' row--running' : ''}`,
+    onclick: (event) => {
+      // The row opens the run; the copy button and both links keep their own
+      // behavior.
+      if (event.target.closest('button, a')) return;
+      location.hash = runPage.runHash(run.run_id);
+    },
+  });
   tr._prev = CELLS.map((cell) => {
     tr.append(cell.build(run));
     return cell.signature(run);
@@ -212,6 +230,14 @@ function buildAirflowCell(run) {
           rel: 'noopener', title: 'Open in Airflow',
         }, icon('arrow-up-right'))
       : null);
+}
+
+function buildChevronCell(run) {
+  return h('td', { class: 'col-chevron' },
+    h('a', {
+      class: 'chevron-link', href: runPage.runHash(run.run_id),
+      'aria-label': `Open ${run.run_id}`,
+    }, icon('chevron')));
 }
 
 // --- credentials popover -------------------------------------------------------------

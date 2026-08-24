@@ -841,8 +841,9 @@ class TestStaticAssets:
             status, content_type, _ = self.request_raw(base_url, "/style.css")
             assert (status, content_type.split(";")[0]) == (200, "text/css")
             # Nested module files must serve too (the tabs live in js/tabs/).
-            status, content_type, _ = self.request_raw(base_url, "/js/tabs/pipelines.js")
-            assert (status, content_type.split(";")[0]) == (200, "text/javascript")
+            for module in ("/js/graph.js", "/js/tabs/pipelines.js", "/js/tabs/pipelines_run.js"):
+                status, content_type, _ = self.request_raw(base_url, module)
+                assert (status, content_type.split(";")[0]) == (200, "text/javascript")
 
     def test_unknown_path_is_404(self, tmp_path: Path) -> None:
         state = build_ui_state(bundle_dir=tmp_path / "absent", data_root=None)
