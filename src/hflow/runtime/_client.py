@@ -228,6 +228,12 @@ class AirflowClient:
         runs = response.get("dag_runs")
         return runs if isinstance(runs, list) else []
 
+    def dag_tasks(self, dag_id: str) -> list[dict[str, Any]]:
+        """The DAG's task definitions (structure and docs, not per-run state)."""
+        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/tasks")
+        tasks = response.get("tasks")
+        return tasks if isinstance(tasks, list) else []
+
     def task_instances(
         self, dag_id: str, dag_run_id: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
