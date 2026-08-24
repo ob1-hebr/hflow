@@ -267,8 +267,8 @@ function renderChecks() {
   if (!data.checks.length) {
     checksSlot.replaceChildren(h('p', { class: 'stage-checks__note' },
       stage === 'sync'
-        ? 'This stage records episodes, not checks — its evidence is the canonical file itself.'
-        : 'No check evidence recorded for this run yet.'));
+        ? 'The sync stage records episodes, not checks — its evidence is the canonical file itself.'
+        : 'No check evidence recorded for this run.'));
     return;
   }
   checksSlot.replaceChildren(

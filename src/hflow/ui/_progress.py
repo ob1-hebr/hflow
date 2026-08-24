@@ -176,58 +176,78 @@ def query_stage_counts(
     return tallies
 
 
-def batch_counts(plan: list[dict[str, Any]], instances: list[dict[str, Any]]) -> StageCounts | None:
-    """Episodes finished, counted by whole batches, or None when unknowable.
+def batch_progress(total: int | None, instances: list[dict[str, Any]]) -> StageCounts | None:
+    """An estimate of episodes finished, from the stage's batch tasks.
 
     The catalog goes quiet when a run replays work it already recorded (the
     append is idempotent, so nothing new lands), and a stage in that state
-    would otherwise read as making no progress at all. A batch task that has
-    ended did finish every episode in its slice either way, so the plan's own
-    batch composition gives an exact lower bound that survives the replay.
+    would otherwise read as making no progress at all. Its batch tasks still
+    succeed one by one, and the run's episodes are spread across them, so the
+    share of batches through is something to say instead of nothing.
 
-    Both this and the catalog undercount rather than over, so the caller takes
-    whichever is further along.
+    An estimate, not a count, in two ways: batches are packed by bytes rather
+    than by episode count, so it is only exact once every batch has succeeded,
+    and a fan-out whose batches finish together moves in one step. The exact
+    composition is in the ``plan`` task's XCom, which is not usable here -- a
+    real run's plan exceeds the inline XCom limit, so the API hands back an
+    object-storage reference rather than the value. Because it can overshoot,
+    the caller prefers the catalog wherever the catalog recorded anything.
+
+    Only *succeeded* batches count. A batch that failed did not work through
+    its episodes and stop: per-episode errors are caught inside the loop
+    (see the sub-DAG template), so a failed batch task died before or during
+    its work, having finished an unknown amount of it.
     """
-    if not plan:
+    if total is None:
         return None
-    sizes = [len(entry.get("items") or ()) for entry in plan]
-    ended = [
+    # map_index -1 is the placeholder Airflow leaves when the fan-out never
+    # expanded (a failed ``plan``); it stands for no batch at all.
+    batches = [
         instance
         for instance in instances
         if str(instance.get("task_id")) == "process_batch"
-        and str(instance.get("state") or "") in _ENDED_TASK_STATES
+        and isinstance(instance.get("map_index"), int)
+        and instance["map_index"] >= 0
     ]
-    if not ended:
+    if not batches:
+        return None  # not expanded yet: nothing to apportion over
+    done = [instance for instance in batches if str(instance.get("state") or "") == "success"]
+    if not done:
         return StageCounts()
-    done = 0
-    for instance in ended:
-        index = instance.get("map_index")
-        if isinstance(index, int) and 0 <= index < len(sizes):
-            done += sizes[index]
-    ends = [parse_timestamp(instance.get("end_date")) for instance in ended]
-    finished_at = [end for end in ends if end is not None]
-    return StageCounts(done=done, last_completed_at=max(finished_at) if finished_at else None)
-
-
-# A batch task in any of these states has stopped working on its episodes.
-_ENDED_TASK_STATES = frozenset({"success", "failed", "skipped", "upstream_failed"})
-
-
-def further_along(first: StageCounts | None, second: StageCounts | None) -> StageCounts | None:
-    """Whichever of two undercounts got further, keeping the richer detail."""
-    if first is None:
-        return second
-    if second is None or second.done <= first.done:
-        return first
-    # The batch count knows nothing of quarantine or errors; the catalog does.
+    finished_at = [
+        stamp
+        for stamp in (parse_timestamp(instance.get("end_date")) for instance in done)
+        if stamp is not None
+    ]
     return StageCounts(
-        done=second.done,
-        quarantined=first.quarantined,
-        errors=first.errors,
-        last_completed_at=max(
-            (stamp for stamp in (first.last_completed_at, second.last_completed_at) if stamp),
-            default=None,
-        ),
+        done=min(total, total * len(done) // len(batches)),
+        last_completed_at=max(finished_at) if finished_at else None,
+    )
+
+
+def prefer_recorded(
+    recorded: StageCounts | None, estimated: StageCounts | None
+) -> StageCounts | None:
+    """The recorded count where there is one, the estimate only in its silence.
+
+    The catalog counts episodes it actually recorded, so it is preferred the
+    moment it has anything to say -- an estimate that can overshoot must never
+    displace a real count. The estimate speaks only for a stage the catalog is
+    silent about, which is what a replayed run looks like.
+    """
+    if recorded is not None and recorded.done > 0:
+        return recorded
+    if estimated is None:
+        return recorded
+    if recorded is None:
+        return estimated
+    # Keep whatever the catalog did know: it saw no completions, but a
+    # quarantine or error row it recorded still counts.
+    return StageCounts(
+        done=estimated.done,
+        quarantined=recorded.quarantined,
+        errors=recorded.errors,
+        last_completed_at=estimated.last_completed_at or recorded.last_completed_at,
     )
 
 
@@ -237,15 +257,20 @@ def query_check_breakdown(
     window: StageWindow,
     *,
     now: datetime,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Per-check outcomes for the episodes one stage finished in ``window``.
 
     What the stage's verification actually found, check by check: how many
     episodes passed, failed, were skipped, or crashed it, and what it cost.
-    An unreadable catalog or a stage that records no checks (sync writes
-    episode rows only) is an empty list, not an error.
+
+    An empty list means the catalog holds no check rows for this stage -- a
+    real answer, and the standing one for sync, which records episode rows
+    only. None means the catalog could not be read, which is not an answer
+    and must not be cached as one.
     """
-    if not _catalog_is_readable(catalog_root) or not uris:
+    if not _catalog_is_readable(catalog_root):
+        return None
+    if not uris:
         return []
     episodes_glob = _parquet_glob(catalog_root / "episodes")
     checks_glob = _parquet_glob(catalog_root / "check_runs")
@@ -280,7 +305,7 @@ def query_check_breakdown(
         columns = [description[0] for description in cursor.description or []]
         rows = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
     except (duckdb.Error, OSError):
-        return []
+        return None
     finally:
         connection.close()
 

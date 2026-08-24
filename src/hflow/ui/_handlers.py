@@ -19,9 +19,9 @@ from hflow.steps import STAGE_INFO, Stage
 from hflow.ui._progress import (
     StageCounts,
     StageWindow,
-    batch_counts,
-    further_along,
+    batch_progress,
     iso_timestamp,
+    prefer_recorded,
     query_check_breakdown,
     query_stage_counts,
     stage_progress,
@@ -175,8 +175,6 @@ def _stages_for_run(
 
 
 def _run_duration_s(run: dict[str, Any]) -> float | None:
-    from datetime import datetime
-
     start_date, end_date = run.get("start_date"), run.get("end_date")
     if not isinstance(start_date, str) or not isinstance(end_date, str):
         return None
@@ -361,9 +359,9 @@ def _stage_cards(
             # answer "none through yet", which is not the same as having no
             # catalog to ask (progress stays null only for the latter). The
             # batch count needs no catalog at all, so it stands on its own.
-            counts = further_along(
+            counts = prefer_recorded(
                 catalog_counts.get(stage, StageCounts()) if catalog_counts is not None else None,
-                _batch_counts(state, sub_dag_id, facts["sub_run_id"])
+                _batch_progress(state, sub_dag_id, facts["sub_run_id"], episode_count)
                 if stage_state == "running"
                 else None,
             )
@@ -438,7 +436,7 @@ def stage_checks_handler(
         return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
     window = stage_windows_from_instances(instances).get(stage)
     uris = _run_conf(run).get("uris")
-    checks: list[dict[str, Any]] = []
+    checks: list[dict[str, Any]] | None = []
     if window is not None and state.data_root is not None and isinstance(uris, list):
         checks = query_check_breakdown(
             state.data_root / "catalog",
@@ -446,8 +444,10 @@ def stage_checks_handler(
             window,
             now=datetime.now(UTC),
         )
-    payload = {"stage": stage.value, "checks": checks}
-    if str(run.get("state")) in _TERMINAL_RUN_STATES:
+    payload = {"stage": stage.value, "checks": checks or []}
+    # Cache a finished run's breakdown, but never a failure to read one: an
+    # unreadable catalog is not the finding "this stage checked nothing".
+    if checks is not None and str(run.get("state")) in _TERMINAL_RUN_STATES:
         if len(state.stage_checks_cache) >= _STAGE_CACHE_LIMIT:
             state.stage_checks_cache.clear()
         state.stage_checks_cache[(run_id, stage.value)] = payload
@@ -460,39 +460,17 @@ def _window_duration_s(window: StageWindow | None) -> float | None:
     return round((window.end - window.start).total_seconds(), 1)
 
 
-def _batch_counts(state: UiState, sub_dag_id: str, sub_run_id: str | None) -> StageCounts | None:
-    """A running stage's progress counted by whole batches, best-effort.
-
-    The plan is fixed for the life of a sub-run, so it is fetched once; the
-    batch task instances are what changes as the stage works through them.
-    """
-    if sub_run_id is None:
+def _batch_progress(
+    state: UiState, sub_dag_id: str, sub_run_id: str | None, total: int | None
+) -> StageCounts | None:
+    """A running stage's progress read off its batch tasks, best-effort."""
+    if sub_run_id is None or total is None:
         return None
-    plan = state.stage_plan_cache.get(sub_run_id)
-    if plan is None:
-        try:
-            entry = state.airflow_call(
-                lambda client: client.xcom_entry(sub_dag_id, sub_run_id, "plan", "return_value")
-            )
-        except AirflowClientError:
-            return None
-        value = entry.get("value")
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                return None
-        if not isinstance(value, list):
-            return None
-        plan = [entry for entry in value if isinstance(entry, dict)]
-        if len(state.stage_plan_cache) >= _STAGE_CACHE_LIMIT:
-            state.stage_plan_cache.clear()
-        state.stage_plan_cache[sub_run_id] = plan
     try:
         instances = state.airflow_call(lambda client: client.task_instances(sub_dag_id, sub_run_id))
     except AirflowClientError:
         return None
-    return batch_counts(plan, instances)
+    return batch_progress(total, instances)
 
 
 def _catalog_counts(
@@ -541,7 +519,12 @@ def _stage_orchestration_facts(
         else None
     )
     facts = {"sub_run_id": sub_run_id, "gate_counts": gate_counts}
-    if stage_state in ("success", "failed"):
+    # Cache only complete facts. An XCom lookup answers None both for "the
+    # task pushed none" and for "Airflow blinked", and caching the second
+    # would lose this stage's tally and links for the rest of the session;
+    # re-asking a stage whose gate genuinely pushed nothing is the cheaper
+    # mistake, and the run-level cache ends it when the run does.
+    if stage_state in ("success", "failed") and gate_counts is not None:
         if len(state.stage_facts_cache) >= _STAGE_CACHE_LIMIT:
             state.stage_facts_cache.clear()
         state.stage_facts_cache[cache_key] = facts
@@ -567,7 +550,14 @@ def run_detail_handler(
     try:
         instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
     except AirflowClientError:
-        instances = []
+        # A blip is not a finding. Render what we can, and cache nothing
+        # derived from the fetch that failed -- a moment's unreachable Airflow
+        # must not freeze a finished run as "every stage pending, forever".
+        summary = _run_summary(state, dag_id, run)
+        return 200, {
+            "run": summary,
+            "stages": _stage_cards(state, dag_id, run, summary["stages"], []),
+        }
     summary = _run_summary(state, dag_id, run, instances)
     cards = _stage_cards(state, dag_id, run, summary["stages"], instances)
     if str(run.get("state")) in _TERMINAL_RUN_STATES:
@@ -778,7 +768,7 @@ def run_graph_handler(
         return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
     return 200, {
         "dag_id": dag_id,
-        "run": _run_summary(state, dag_id, run),
+        "run": _run_summary(state, dag_id, run, instances),
         "nodes": _graph_nodes(
             tasks,
             instances,

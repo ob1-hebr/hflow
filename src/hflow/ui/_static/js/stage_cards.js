@@ -33,6 +33,11 @@ export function createStageCards({ onOpen = null }) {
           const next = stageCard(card, firstNumber + index, onOpen);
           node.replaceWith(next);
           node = next;
+        } else {
+          // Pace and estimate move on every poll of a running stage. Writing
+          // them in place is what keeps the card itself alive: rebuilding it
+          // would restart the pulse and drop the reader's focus every 3s.
+          refreshMetrics(node, card);
         }
       } else {
         node = stageCard(card, firstNumber + index, onOpen);
@@ -48,10 +53,21 @@ export function createStageCards({ onOpen = null }) {
   return { el, render };
 }
 
+// Everything that changes the card's shape -- deliberately not the pace and
+// estimate, which move every poll and are written in place instead.
 function cardSignature(card) {
+  const p = card.progress;
   return JSON.stringify([
-    card.state, card.waiting_on, card.reached, card.total, card.duration_s, card.progress,
+    card.state, card.waiting_on, card.reached, card.total, card.duration_s, card.sub_run_url,
+    p && [p.done, p.quarantined, p.errors, p.stalled],
   ]);
+}
+
+function refreshMetrics(node, card) {
+  const row = node.querySelector('.stage-card__pace');
+  if (!row || !card.progress) return;
+  const next = metricsRow(card, card.progress);
+  if (next) row.replaceChildren(...next.childNodes);
 }
 
 // --- one card -----------------------------------------------------------------
@@ -106,7 +122,7 @@ function stageCard(card, number, onOpen) {
       progress === null && card.state !== 'pending' && card.state !== 'skipped'
         ? h('p', {
             class: 'stage-card__metrics',
-            title: 'Serve the dashboard with --data-root to read the pipeline’s catalog',
+            title: 'Counts come from the pipeline’s catalog under the served data root',
           }, 'Episode counts unavailable')
         : null,
       stalled ? stalledNote(progress) : null));
@@ -144,7 +160,7 @@ function metricsRow(card, progress) {
     facts.push(h('span', { class: 'metric--error' }, `${progress.errors} errored`));
   }
   if (!facts.length) return null;
-  return h('p', { class: 'stage-card__metrics' }, joinFacts(facts));
+  return h('p', { class: 'stage-card__metrics stage-card__pace' }, joinFacts(facts));
 }
 
 function stalledNote(progress) {

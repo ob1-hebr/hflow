@@ -41,9 +41,6 @@ class UiState:
     stage_facts_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     # One finished run's check breakdown per stage, keyed (run_id, stage).
     stage_checks_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
-    # A stage sub-run's batch plan, keyed by sub-run id. Fixed once planned, so
-    # the progress poll fetches each run's plan exactly once.
-    stage_plan_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def airflow_call(self, call: "Callable[[AirflowClient], _CallResult]") -> _CallResult:
         if self.airflow is None:

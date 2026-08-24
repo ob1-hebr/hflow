@@ -85,6 +85,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     xcom_requests: ClassVar[list[tuple[str, str]]] = []
     dag_tasks_requests: ClassVar[list[str]] = []
     reject_order_by: ClassVar[bool] = False
+    fail_task_instances: ClassVar[bool] = False  # a blip, not a 404
 
     def _respond_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode()
@@ -119,6 +120,9 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         if segments[-1] == "taskInstances":
             run_id = segments[5]
             cls.task_instance_requests.append(run_id)
+            if cls.fail_task_instances:
+                self._respond_json(503, {"detail": "scheduler restarting"})
+                return
             self._respond_json(200, {"task_instances": cls.task_instances_by_run.get(run_id, [])})
             return
         if segments[-1] == "tasks" and len(segments) == 5:
@@ -176,6 +180,7 @@ def stub_airflow() -> Iterator[str]:
     _StubAirflowHandler.xcom_requests = []
     _StubAirflowHandler.dag_tasks_requests = []
     _StubAirflowHandler.reject_order_by = False
+    _StubAirflowHandler.fail_task_instances = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StubAirflowHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -769,12 +774,7 @@ class TestStageCardProgress:
         # dedupes), so the finished batches are the only evidence of progress.
         seed_progress_run(run_state="running", stage_windows={"meta": (120, None)})
         sub_run_id = "manual__sub-meta"
-        _StubAirflowHandler.xcom_values = {
-            (PROGRESS_RUN_ID, "trigger_meta"): sub_run_id,
-            (sub_run_id, "plan"): json.dumps(
-                [{"items": PROGRESS_URIS[:3]}, {"items": PROGRESS_URIS[3:]}]
-            ),
-        }
+        _StubAirflowHandler.xcom_values = {(PROGRESS_RUN_ID, "trigger_meta"): sub_run_id}
         _StubAirflowHandler.task_instances_by_run[sub_run_id] = [
             {
                 "task_id": "process_batch",
@@ -787,9 +787,9 @@ class TestStageCardProgress:
         with running_ui(catalog_state) as base_url:
             _, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
         meta = {card["stage"]: card for card in payload["stages"]}["meta"]
-        # The three episodes of the finished batch; the batch in flight counts
-        # for nothing until it ends.
-        assert meta["progress"]["done"] == 3
+        # One batch of two through, so half the run's five episodes; the batch
+        # in flight counts for nothing until it ends.
+        assert meta["progress"]["done"] == 2
         assert meta["progress"]["eta_s"] > 0
 
     def test_stages_of_a_failed_run_are_not_waiting_on_anything(
@@ -839,6 +839,41 @@ class TestStageCardProgress:
         # nothing: no task instances, no XComs.
         assert _StubAirflowHandler.xcom_requests == requests_after_first
         assert _StubAirflowHandler.task_instance_requests == instances_after_first
+
+    def test_a_blip_is_not_cached_as_a_finished_run_s_verdict(self, catalog_state: UiState) -> None:
+        # Airflow answering the run but blinking on its task instances used to
+        # freeze a finished run as "every stage pending, no counts" for the
+        # rest of the session.
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0)
+        seed_progress_run(run_state="success", stage_windows={"meta": (120, 0)})
+        _StubAirflowHandler.fail_task_instances = True
+        with running_ui(catalog_state) as base_url:
+            status, degraded = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+            assert status == 200
+            assert all(card["state"] == "pending" for card in degraded["stages"])
+            _StubAirflowHandler.fail_task_instances = False
+            _, healed = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        meta = {card["stage"]: card for card in healed["stages"]}["meta"]
+        assert meta["state"] == "success"
+        assert meta["progress"]["done"] == 1
+
+    def test_a_catalog_read_failure_is_not_cached_as_an_empty_breakdown(
+        self, catalog_state: UiState
+    ) -> None:
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0, errored=True)
+        seed_progress_run(run_state="success", stage_windows={"meta": (120, 0)})
+        marker = catalog_state.data_root / "catalog" / "format_version"
+        readable = marker.read_text()
+        marker.write_text("999")  # a version this build cannot read
+        path = f"/api/pipelines/runs/{PROGRESS_RUN_ID}/stages/meta/checks"
+        with running_ui(catalog_state) as base_url:
+            _, unreadable_payload = request_json(base_url, path)
+            assert unreadable_payload["checks"] == []
+            marker.write_text(readable)
+            _, healed = request_json(base_url, path)
+        assert [check["name"] for check in healed["checks"]] == ["camera_health"]
 
     def test_a_malformed_conf_costs_the_counts_not_the_page(self, catalog_state: UiState) -> None:
         _StubAirflowHandler.dag_run_list = [
