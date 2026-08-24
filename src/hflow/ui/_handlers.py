@@ -10,11 +10,20 @@ copyable command.
 import json
 import re
 import urllib.parse
+from datetime import UTC, datetime
 from typing import Any
 
 from hflow import __version__
 from hflow.runtime import AirflowClient, AirflowClientError, bundle_dag_ids
-from hflow.steps import Stage
+from hflow.steps import STAGE_INFO, Stage
+from hflow.ui._progress import (
+    StageCounts,
+    StageWindow,
+    iso_timestamp,
+    query_stage_counts,
+    stage_progress,
+    stage_windows_from_instances,
+)
 from hflow.ui._state import UiState
 
 JsonResponse = tuple[int, dict[str, Any]]
@@ -132,15 +141,26 @@ def _derive_stage_states(task_instances: list[dict[str, Any]]) -> dict[str, str]
     return stage_states
 
 
-def _stages_for_run(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, str]:
+def _stages_for_run(
+    state: UiState,
+    dag_id: str,
+    run: dict[str, Any],
+    instances: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    """Per-stage states, from the cache, from ``instances``, or by fetching them.
+
+    A caller that needs the task instances for itself (the run page, for its
+    stage windows) passes them in so the poll stays at one fetch.
+    """
     run_id = str(run.get("dag_run_id"))
     cached = state.stage_cache.get(run_id)
     if cached is not None:
         return cached
-    try:
-        instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
-    except AirflowClientError:
-        return {stage.value: "pending" for stage in Stage}
+    if instances is None:
+        try:
+            instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
+        except AirflowClientError:
+            return {stage.value: "pending" for stage in Stage}
     stage_states = _derive_stage_states(instances)
     if str(run.get("state")) in _TERMINAL_RUN_STATES:
         # Finished runs never change again; keep the poll at one Airflow call
@@ -188,12 +208,17 @@ def _run_header(base_url: str, dag_id: str, run: dict[str, Any]) -> dict[str, An
     }
 
 
-def _run_summary(state: UiState, dag_id: str, run: dict[str, Any]) -> dict[str, Any]:
+def _run_summary(
+    state: UiState,
+    dag_id: str,
+    run: dict[str, Any],
+    instances: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     assert state.bundle is not None
     return {
         **_run_header(state.bundle.api_base_url, dag_id, run),
         "profile": _run_conf(run).get("profile"),
-        "stages": _stages_for_run(state, dag_id, run),
+        "stages": _stages_for_run(state, dag_id, run, instances),
     }
 
 
@@ -248,6 +273,191 @@ def _sub_run_id_from_xcom(state: UiState, dag_id: str, run_id: str, stage: Stage
     return value if isinstance(value, str) and value else None
 
 
+# Each stage sub-DAG ends in a budget gate whose return value is that stage's
+# own tally. It is the authoritative end-of-stage count -- immune to the
+# catalog's replay blindness -- so a finished stage prefers it and falls back
+# to the catalog when the gate raised (budget exceeded) or was never reached.
+_GATE_TASK_IDS = dict.fromkeys(Stage, "error_budget_gate") | {Stage.META: "quarantine_budget_gate"}
+
+
+def _gate_counts(
+    state: UiState, sub_dag_id: str, sub_run_id: str, stage: Stage
+) -> StageCounts | None:
+    """One finished stage's own tally, from its budget gate's XCom."""
+    try:
+        entry = state.airflow_call(
+            lambda client: client.xcom_entry(
+                sub_dag_id, sub_run_id, _GATE_TASK_IDS[stage], "return_value"
+            )
+        )
+    except AirflowClientError:
+        return None
+    value = entry.get("value")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, dict) or not isinstance(value.get("total"), int):
+        return None
+    return StageCounts(
+        done=value["total"],
+        quarantined=int(value.get("quarantined") or 0),
+        errors=int(value.get("errors") or 0),
+    )
+
+
+def _waiting_on(stage: Stage, stage_states: dict[str, str]) -> str | None:
+    """The unfinished stage a pending stage is queued behind, if any.
+
+    None once everything ahead of it is done or disabled -- it is about to
+    start, not waiting on anyone.
+    """
+    stages = list(Stage)
+    for earlier in reversed(stages[: stages.index(stage)]):
+        if stage_states.get(earlier.value) not in ("skipped", "success"):
+            return earlier.value
+    return None
+
+
+def _stage_cards(
+    state: UiState,
+    dag_id: str,
+    run: dict[str, Any],
+    stage_states: dict[str, str],
+    instances: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One card per stage: what it is, how far its episodes got, what it costs.
+
+    The card's core -- identity, state, and episode progress -- is deliberately
+    free of Airflow vocabulary: a verification stage backed by an external
+    service (human review, say) can fill the same shape from its own API, with
+    the orchestration block left null.
+    """
+    assert state.bundle is not None
+    base_url = state.bundle.api_base_url
+    run_id = str(run.get("dag_run_id"))
+    episode_count = _run_header(base_url, dag_id, run)["episode_count"]
+    stage_dag_ids = dict(zip(Stage, bundle_dag_ids(dag_id)[1:], strict=True))
+    windows = stage_windows_from_instances(instances)
+    now = datetime.now(UTC)
+    catalog_counts = _catalog_counts(state, run, windows, now)
+
+    cards: list[dict[str, Any]] = []
+    for stage in Stage:
+        info = STAGE_INFO[stage]
+        stage_state = stage_states[stage.value]
+        sub_dag_id = stage_dag_ids[stage]
+        facts = _stage_orchestration_facts(state, dag_id, run_id, stage, stage_state, sub_dag_id)
+        window = windows.get(stage)
+        gate: StageCounts | None = facts["gate_counts"]
+        # A readable catalog that names no episodes for this stage is the
+        # answer "none through yet", which is not the same as having no
+        # catalog to ask (progress stays null only for the latter).
+        counts = gate
+        if counts is None and catalog_counts is not None:
+            counts = catalog_counts.get(stage, StageCounts())
+        # A finished stage counted its own episodes; before then, the run's
+        # conf is the only statement of how many there are to do.
+        total = gate.done if gate is not None else episode_count
+        cards.append(
+            {
+                "stage": stage.value,
+                "title": info.title,
+                "description": info.description,
+                "layer": info.layer.value,
+                "state": stage_state,
+                "waiting_on": (
+                    _waiting_on(stage, stage_states) if stage_state == "pending" else None
+                ),
+                "total": total,
+                "started_at": iso_timestamp(window.start) if window else None,
+                "ended_at": iso_timestamp(window.end) if window and window.end else None,
+                "duration_s": _window_duration_s(window),
+                "progress": (
+                    stage_progress(
+                        counts,
+                        total=total,
+                        window=window,
+                        running=stage_state == "running",
+                        now=now,
+                    )
+                    if window is not None and counts is not None
+                    else None
+                ),
+                # Orchestration detail: where this stage ran, for the drill-in.
+                "sub_dag_id": sub_dag_id,
+                "sub_dag_url": f"{base_url}/dags/{sub_dag_id}",
+                "sub_run_id": facts["sub_run_id"],
+                "sub_run_url": (
+                    _airflow_run_url(base_url, sub_dag_id, facts["sub_run_id"])
+                    if facts["sub_run_id"]
+                    else None
+                ),
+            }
+        )
+    return cards
+
+
+def _window_duration_s(window: StageWindow | None) -> float | None:
+    if window is None or window.end is None:
+        return None
+    return round((window.end - window.start).total_seconds(), 1)
+
+
+def _catalog_counts(
+    state: UiState,
+    run: dict[str, Any],
+    windows: dict[Stage, StageWindow],
+    now: datetime,
+) -> dict[Stage, StageCounts] | None:
+    """Episode counts per stage from the catalog the run itself wrote."""
+    if state.data_root is None:
+        return None
+    uris = _run_conf(run).get("uris")
+    if not isinstance(uris, list):
+        return None
+    return query_stage_counts(
+        state.data_root / "catalog",
+        [uri for uri in uris if isinstance(uri, str)],
+        windows,
+        now=now,
+    )
+
+
+def _stage_orchestration_facts(
+    state: UiState,
+    dag_id: str,
+    run_id: str,
+    stage: Stage,
+    stage_state: str,
+    sub_dag_id: str,
+) -> dict[str, Any]:
+    """The stage's sub-run id and, once it is finished, its gate tally.
+
+    Cached per finished stage: a stage that ended cannot change again, so a
+    long run stops re-asking Airflow about the stages it already completed.
+    """
+    if stage_state in ("pending", "skipped"):
+        return {"sub_run_id": None, "gate_counts": None}
+    cache_key = (run_id, stage.value)
+    cached = state.stage_facts_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    sub_run_id = _sub_run_id_from_xcom(state, dag_id, run_id, stage)
+    gate_counts = (
+        _gate_counts(state, sub_dag_id, sub_run_id, stage)
+        if sub_run_id and stage_state in ("success", "failed")
+        else None
+    )
+    facts = {"sub_run_id": sub_run_id, "gate_counts": gate_counts}
+    if stage_state in ("success", "failed"):
+        if len(state.stage_facts_cache) >= _STAGE_CACHE_LIMIT:
+            state.stage_facts_cache.clear()
+        state.stage_facts_cache[cache_key] = facts
+    return facts
+
+
 def run_detail_handler(
     state: UiState, match: re.Match[str], query: Query, body: dict[str, Any] | None
 ) -> JsonResponse:
@@ -261,29 +471,22 @@ def run_detail_handler(
         if error.status == 404:
             return _error(404, f"no run {run_id!r} on {dag_id}")
         return _error(503, f"Airflow is not reachable: {error}", hint=_RUNTIME_DOWN_HINT)
-    summary = _run_summary(state, dag_id, run)
-    base_url = state.bundle.api_base_url
-    stage_dag_ids = dict(zip(Stage, bundle_dag_ids(dag_id)[1:], strict=True))
-    stages: list[dict[str, Any]] = []
-    for stage in Stage:
-        sub_dag_id = stage_dag_ids[stage]
-        stage_state = summary["stages"][stage.value]
-        sub_run_id = None
-        if stage_state not in ("pending", "skipped"):
-            sub_run_id = _sub_run_id_from_xcom(state, dag_id, run_id, stage)
-        stages.append(
-            {
-                "stage": stage.value,
-                "sub_dag_id": sub_dag_id,
-                "state": stage_state,
-                "sub_dag_url": f"{base_url}/dags/{sub_dag_id}",
-                "sub_run_id": sub_run_id,
-                "sub_run_url": (
-                    _airflow_run_url(base_url, sub_dag_id, sub_run_id) if sub_run_id else None
-                ),
-            }
-        )
-    return 200, {"run": summary, "stages": stages}
+    cached_cards = state.run_cards_cache.get(run_id)
+    if cached_cards is not None:
+        return 200, {"run": _run_summary(state, dag_id, run), "stages": cached_cards}
+    try:
+        instances = state.airflow_call(lambda client: client.task_instances(dag_id, run_id))
+    except AirflowClientError:
+        instances = []
+    summary = _run_summary(state, dag_id, run, instances)
+    cards = _stage_cards(state, dag_id, run, summary["stages"], instances)
+    if str(run.get("state")) in _TERMINAL_RUN_STATES:
+        # A finished run's cards are final; the poll that watched it end is the
+        # last one that has to compute them.
+        if len(state.run_cards_cache) >= _STAGE_CACHE_LIMIT:
+            state.run_cards_cache.clear()
+        state.run_cards_cache[run_id] = cards
+    return 200, {"run": summary, "stages": cards}
 
 
 # ---------------------------------------------------------------------------

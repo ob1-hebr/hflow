@@ -33,6 +33,12 @@ class UiState:
     # per dag_id; a re-render mid-session is caught by the membership guard in
     # :func:`hflow.ui._handlers._dag_structure`.
     dag_tasks_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # The run page's stage cards, for finished runs (nothing left to recompute).
+    run_cards_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Per finished stage of a still-running run, keyed (run_id, stage): its
+    # sub-run id and gate tally, so a long run stops re-asking Airflow about
+    # the stages it already completed.
+    stage_facts_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
     def airflow_call(self, call: "Callable[[AirflowClient], _CallResult]") -> _CallResult:
         if self.airflow is None:

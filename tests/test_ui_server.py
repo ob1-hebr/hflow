@@ -11,13 +11,17 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
 
+import hflow
+from hflow.catalog import Catalog, CheckRunRow
 from hflow.runtime import AirflowClient, RuntimeConfig, render_bundle
+from hflow.transform import EpisodeStamps
 from hflow.ui import UiState, build_ui_state, create_ui_server
 
 PIPELINE_SOURCE = "import hflow\n\napp = hflow.App('demo', data_root='/opt/airflow/data')\n"
@@ -562,6 +566,263 @@ class TestRunDetail:
         with running_ui(observing_state) as base_url:
             status, _ = request_json(base_url, "/api/pipelines/runs/manual__absent")
         assert status == 404
+
+    def test_cards_carry_stage_identity_without_a_catalog(self, observing_state: UiState) -> None:
+        # No data root to read: the pipeline still reads as a pipeline, it just
+        # cannot say how many episodes are through.
+        seed_two_runs()
+        with running_ui(observing_state) as base_url:
+            _, payload = request_json(base_url, f"/api/pipelines/runs/{ENCODED_SUCCESS_RUN_ID}")
+        cards = {card["stage"]: card for card in payload["stages"]}
+        assert cards["meta"]["title"] == "Metadata"
+        assert cards["meta"]["description"].startswith("Quality checks")
+        assert cards["meta"]["layer"] == "automated"
+        assert cards["labels"]["layer"] == "model"
+        assert all(card["progress"] is None for card in cards.values())
+
+
+# --- stage cards over a real catalog -----------------------------------------
+#
+# Progress is read from the Parquet the pipeline itself writes, so these tests
+# write real catalog appends and place the run's stage windows around them.
+# Appends are stamped "now", which is why the runs are seeded relative to now
+# rather than at fixed dates.
+
+CATALOG_STAMPS = EpisodeStamps(
+    schema_version="1",
+    pipeline_version="abc123def456",
+    ffmpeg_version="ffmpeg version test",
+    robot_software_version="sim-0.1.0",
+)
+PROGRESS_URIS = ["a.mcap", "b.mcap", "c.mcap", "d.mcap", "e.mcap"]
+
+
+def append_episode_row(
+    data_root: Path, index: int, *, quarantined: bool = False, errored: bool = False
+) -> None:
+    """One finished episode, recorded the way a stage's process_batch records it."""
+    canonical = data_root / f"episode-{index}.canonical.mcap"
+    canonical.write_bytes(f"canonical bytes {index}".encode())
+    check_rows = []
+    if quarantined or errored:
+        check_rows.append(
+            CheckRunRow(
+                check_name="camera_health",
+                check_version="v1",
+                critical=True,
+                status=hflow.CheckStatus.ERROR if errored else hflow.CheckStatus.FAILED,
+                duration_s=0.5,
+                error="boom" if errored else None,
+            )
+        )
+    Catalog(data_root / "catalog").append_episode(
+        canonical_path=canonical,
+        stamps=CATALOG_STAMPS,
+        episode_metadata={},
+        check_rows=check_rows,
+        quarantine_tags=["quarantined:camera_health"] if quarantined else [],
+        source_uri=PROGRESS_URIS[index],
+    )
+
+
+PROGRESS_RUN_ID = "manual__progress"
+
+
+def seed_progress_run(
+    *, run_state: str, stage_windows: dict[str, tuple[float, float | None]]
+) -> None:
+    """A run whose stage windows are offsets in seconds before now.
+
+    ``stage_windows`` maps a stage to (started_s_ago, ended_s_ago); an ended
+    offset of None leaves the stage running, so its window stays open.
+    """
+    now = datetime.now(UTC)
+
+    def stamp(seconds_ago: float) -> str:
+        return (now - timedelta(seconds=seconds_ago)).isoformat()
+
+    instances: list[dict[str, Any]] = []
+    for stage in STAGES:
+        window = stage_windows.get(stage)
+        if window is None:
+            instances.append({"task_id": f"enabled_{stage}", "state": "success"})
+            continue
+        started, ended = window
+        instances.append({"task_id": f"enabled_{stage}", "state": "success"})
+        instances.append(
+            {
+                "task_id": f"trigger_{stage}",
+                "state": "success" if ended is not None else "deferred",
+                "start_date": stamp(started),
+                "end_date": None if ended is None else stamp(ended),
+            }
+        )
+    _StubAirflowHandler.dag_run_list = [
+        {
+            "dag_run_id": PROGRESS_RUN_ID,
+            "state": run_state,
+            "run_after": stamp(600),
+            "start_date": stamp(600),
+            "end_date": None if run_state == "running" else stamp(0),
+            "conf": {"uris": list(PROGRESS_URIS), "profile": "full", "mode": "batch"},
+        }
+    ]
+    _StubAirflowHandler.task_instances_by_run = {PROGRESS_RUN_ID: instances}
+
+
+@pytest.fixture
+def catalog_state(rendered_bundle_dir: Path, tmp_path: Path) -> Iterator[UiState]:
+    """An observing UiState whose data root is where the catalog gets written."""
+    data_root = tmp_path / "data"
+    data_root.mkdir(exist_ok=True)
+    state = build_ui_state(bundle_dir=rendered_bundle_dir, data_root=data_root)
+    assert state.data_root is not None
+    with stub_airflow() as airflow_url:
+        state.airflow = AirflowClient(airflow_url, "airflow", "pw")
+        yield state
+
+
+class TestStageCardProgress:
+    def test_a_running_stage_counts_the_episodes_it_finished(self, catalog_state: UiState) -> None:
+        assert catalog_state.data_root is not None
+        for index in range(3):
+            append_episode_row(catalog_state.data_root, index)
+        append_episode_row(catalog_state.data_root, 3, quarantined=True)
+        append_episode_row(catalog_state.data_root, 4, errored=True)
+        # Sync finished before any of those appends; meta is running now.
+        seed_progress_run(
+            run_state="running", stage_windows={"sync": (600, 500), "meta": (120, None)}
+        )
+        with running_ui(catalog_state) as base_url:
+            status, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+
+        assert status == 200
+        cards = {card["stage"]: card for card in payload["stages"]}
+        meta = cards["meta"]["progress"]
+        assert meta["done"] == 5
+        assert meta["quarantined"] == 1
+        assert meta["errors"] == 1
+        assert meta["throughput_eps_per_min"] > 0
+        assert meta["last_completed_at"] is not None
+        assert meta["stalled"] is False
+        # The window is what attributes an append to a stage: sync's closed
+        # before these episodes landed, so none of them are its work.
+        assert cards["sync"]["progress"]["done"] == 0
+        assert cards["sync"]["total"] == len(PROGRESS_URIS)
+
+    def test_an_estimate_appears_once_something_finishes(self, catalog_state: UiState) -> None:
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0)
+        seed_progress_run(run_state="running", stage_windows={"meta": (60, None)})
+        with running_ui(catalog_state) as base_url:
+            _, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        meta = {card["stage"]: card for card in payload["stages"]}["meta"]
+        assert meta["progress"]["done"] == 1
+        assert meta["progress"]["eta_s"] > 0  # four of five left to do
+        assert meta["state"] == "running"
+
+    def test_sync_appends_no_checks_and_still_counts(self, catalog_state: UiState) -> None:
+        # The sync stage records episode rows with no check rows at all; those
+        # episodes are done all the same.
+        assert catalog_state.data_root is not None
+        for index in range(2):
+            append_episode_row(catalog_state.data_root, index)
+        seed_progress_run(run_state="running", stage_windows={"sync": (60, None)})
+        with running_ui(catalog_state) as base_url:
+            _, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        cards = {card["stage"]: card for card in payload["stages"]}
+        assert cards["sync"]["progress"]["done"] == 2
+        assert cards["sync"]["progress"]["errors"] == 0
+        # A stage that has not been triggered has no window and no progress,
+        # and names the unfinished stage ahead of it.
+        assert cards["labels"]["progress"] is None
+        assert cards["labels"]["waiting_on"] == "meta"
+
+    def test_pending_stages_name_the_enabled_stage_they_wait_on(
+        self, catalog_state: UiState
+    ) -> None:
+        _StubAirflowHandler.dag_run_list = [
+            {
+                "dag_run_id": PROGRESS_RUN_ID,
+                "state": "running",
+                "run_after": "2026-08-24T01:00:00+00:00",
+                "conf": {"uris": ["a.mcap"], "profile": "metadata_backfill", "mode": "batch"},
+            }
+        ]
+        _StubAirflowHandler.task_instances_by_run = {
+            PROGRESS_RUN_ID: [
+                {"task_id": "enabled_sync", "state": "skipped"},
+                {"task_id": "enabled_meta", "state": "success"},
+            ]
+        }
+        with running_ui(catalog_state) as base_url:
+            _, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        cards = {card["stage"]: card for card in payload["stages"]}
+        # Nothing enabled runs before meta here, so it waits on nothing.
+        assert cards["meta"]["state"] == "pending"
+        assert cards["meta"]["waiting_on"] is None
+        assert cards["sync"]["state"] == "skipped"
+        assert cards["sync"]["waiting_on"] is None
+
+    def test_a_finished_stage_prefers_its_own_tally_and_is_computed_once(
+        self, catalog_state: UiState
+    ) -> None:
+        assert catalog_state.data_root is not None
+        append_episode_row(catalog_state.data_root, 0)
+        seed_progress_run(run_state="success", stage_windows={"meta": (120, 0)})
+        sub_run_id = "manual__sub-meta"
+        _StubAirflowHandler.xcom_values = {
+            (PROGRESS_RUN_ID, "trigger_meta"): sub_run_id,
+            (sub_run_id, "quarantine_budget_gate"): json.dumps(
+                {"total": 5, "quarantined": 2, "errors": 0, "budget": 8}
+            ),
+        }
+        with running_ui(catalog_state) as base_url:
+            status, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+            requests_after_first = list(_StubAirflowHandler.xcom_requests)
+            instances_after_first = list(_StubAirflowHandler.task_instance_requests)
+            request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+
+        assert status == 200
+        meta = {card["stage"]: card for card in payload["stages"]}["meta"]
+        # The gate counted 5 episodes; only one append is visible in the
+        # catalog (a replayed run appends nothing), and the gate wins.
+        assert meta["total"] == 5
+        assert meta["progress"]["done"] == 5
+        assert meta["progress"]["quarantined"] == 2
+        assert meta["progress"]["eta_s"] is None
+        assert meta["duration_s"] == pytest.approx(120, abs=2)
+        # A finished run's cards never change, so the second poll recomputes
+        # nothing: no task instances, no XComs.
+        assert _StubAirflowHandler.xcom_requests == requests_after_first
+        assert _StubAirflowHandler.task_instance_requests == instances_after_first
+
+    def test_a_malformed_conf_costs_the_counts_not_the_page(self, catalog_state: UiState) -> None:
+        _StubAirflowHandler.dag_run_list = [
+            {
+                "dag_run_id": PROGRESS_RUN_ID,
+                "state": "running",
+                "run_after": "2026-08-24T01:00:00+00:00",
+                "conf": {"uris": "a.mcap"},  # a string where a list belongs
+            }
+        ]
+        _StubAirflowHandler.task_instances_by_run = {
+            PROGRESS_RUN_ID: [
+                {"task_id": "enabled_sync", "state": "success"},
+                {
+                    "task_id": "trigger_sync",
+                    "state": "deferred",
+                    "start_date": datetime.now(UTC).isoformat(),
+                },
+            ]
+        }
+        with running_ui(catalog_state) as base_url:
+            status, payload = request_json(base_url, f"/api/pipelines/runs/{PROGRESS_RUN_ID}")
+        assert status == 200
+        cards = {card["stage"]: card for card in payload["stages"]}
+        assert cards["sync"]["state"] == "running"
+        assert cards["sync"]["progress"] is None
+        assert cards["sync"]["total"] is None
 
 
 class TestRunGraph:
