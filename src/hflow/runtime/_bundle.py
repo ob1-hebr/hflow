@@ -78,7 +78,7 @@ from hflow.runtime._templates import (
     SUB_DAG_ERROR_GATE_TEMPLATE,
     SUB_DAG_QUARANTINE_GATE_TEMPLATE,
 )
-from hflow.steps import RUN_PROFILES, Stage
+from hflow.steps import RUN_PROFILES, STAGE_INFO, Stage
 from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
@@ -378,21 +378,11 @@ def warn_if_pipeline_data_root_differs(
             )
 
 
-# Figure 4's sub-DAG display names, in the blog figure's own words.
-STAGE_TITLES: dict[Stage, str] = {
-    Stage.SYNC: "Transform & sync",
-    Stage.META: "Metadata",
-    Stage.LABELS: "Labels & artifacts",
-    Stage.MEDIA: "Media",
-}
-
-# One-line stage purposes, shown in the Airflow UI (DAG-list description and
-# each sub-DAG's doc_md). One owner for the demo-facing vocabulary.
+# The stage vocabulary is owned by hflow.steps (STAGE_INFO); these views keep
+# the render call-sites and their historical import path.
+STAGE_TITLES: dict[Stage, str] = {stage: info.title for stage, info in STAGE_INFO.items()}
 STAGE_DESCRIPTIONS: dict[Stage, str] = {
-    Stage.SYNC: "Canonical transform -- the critical path (Figure 4: Transform & sync).",
-    Stage.META: "Quality checks + catalog registration, with the run's quarantine budget.",
-    Stage.LABELS: "Enrichments -- non-critical, failure isolated.",
-    Stage.MEDIA: "Derived media: per-camera contact sheets recorded as catalog artifacts.",
+    stage: info.description for stage, info in STAGE_INFO.items()
 }
 
 

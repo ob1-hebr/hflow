@@ -7,6 +7,8 @@ import pytest
 
 import hflow
 from hflow.curation import open_catalog_connection
+from hflow.runtime._bundle import STAGE_DESCRIPTIONS, STAGE_TITLES
+from hflow.steps import STAGE_INFO, VerificationLayer
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 FAST_SPEC = SyntheticEpisodeSpec(duration_s=2.0, cameras=())
@@ -206,3 +208,15 @@ def test_run_profiles_vocabulary() -> None:
     assert hflow.stages_for_profile("full") == frozenset(hflow.Stage)
     assert hflow.RUN_PROFILES["relabel"] == frozenset({hflow.Stage.LABELS})
     assert hflow.RUN_PROFILES["metadata_backfill"] == frozenset({hflow.Stage.META})
+
+
+def test_every_stage_has_human_facing_identity() -> None:
+    assert set(STAGE_INFO) == set(hflow.Stage)
+    for stage, info in STAGE_INFO.items():
+        assert info.title and info.description, stage
+        assert isinstance(info.layer, VerificationLayer), stage
+
+
+def test_the_dag_renderer_derives_its_stage_strings_from_the_one_owner() -> None:
+    assert {stage: info.title for stage, info in STAGE_INFO.items()} == STAGE_TITLES
+    assert {stage: info.description for stage, info in STAGE_INFO.items()} == STAGE_DESCRIPTIONS
