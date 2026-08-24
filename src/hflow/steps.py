@@ -67,6 +67,76 @@ def stages_for_profile(name: str) -> frozenset[Stage]:
         ) from None
 
 
+class VerificationLayer(StrEnum):
+    """Which verification family vouches for a stage's output.
+
+    A QC pipeline layers three kinds of verification: deterministic automated
+    checks, model-backed judgment, and human review. Stages carry their layer
+    so consumers (the dashboard, future reporting) can present the pipeline in
+    those terms. ``HUMAN`` is reserved for review stages backed by external
+    annotation services; no built-in stage uses it yet.
+    """
+
+    AUTOMATED = "automated"  # deterministic checks and transforms
+    MODEL = "model"  # model-backed enrichment or verification
+    HUMAN = "human"  # human review (external annotation services)
+
+
+@dataclass(frozen=True)
+class StageInfo:
+    """Human-facing identity of one stage.
+
+    Single owner of this vocabulary: the DAG renderer bakes it into the
+    generated DAGs' docs and the dashboard serves it on stage cards, so the
+    two can never disagree.
+    """
+
+    title: str
+    description: str
+    layer: VerificationLayer
+
+
+# Figure 4's sub-DAG display names and one-line purposes. These are read by
+# people watching a run -- in the dashboard's stage cards and in the generated
+# DAGs' docs -- so they say what the stage does to the data, not where it sits
+# in the paper's diagram.
+STAGE_INFO: dict[Stage, StageInfo] = {
+    Stage.SYNC: StageInfo(
+        title="Transform & sync",
+        description=(
+            "Turns each raw recording into the canonical episode file every "
+            "later stage reads. The critical path: nothing proceeds without it."
+        ),
+        layer=VerificationLayer.AUTOMATED,
+    ),
+    Stage.META: StageInfo(
+        title="Quality checks",
+        description=(
+            "Runs every registered check over each episode and records the "
+            "evidence in the catalog. Episodes that fail a critical check are "
+            "quarantined; mass failure trips the run's quarantine budget."
+        ),
+        layer=VerificationLayer.AUTOMATED,
+    ),
+    Stage.LABELS: StageInfo(
+        title="Labels & artifacts",
+        description=(
+            "Derives labels and artifacts from each episode. Never gates the "
+            "run -- a failure here isolates to the episode it happened on."
+        ),
+        layer=VerificationLayer.MODEL,
+    ),
+    Stage.MEDIA: StageInfo(
+        title="Media",
+        description=(
+            "Renders per-camera contact sheets so a human can eyeball an "
+            "episode without opening it, recorded as catalog artifacts."
+        ),
+        layer=VerificationLayer.AUTOMATED,
+    ),
+}
+
+
 class CheckStatus(StrEnum):
     """Outcome classification of one step invocation.
 

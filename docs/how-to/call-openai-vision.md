@@ -42,8 +42,10 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
 Do not put API keys in a pipeline file, runtime bundle, or committed `.env`
-file. The local process and Airflow worker should receive them through their
-secret-management environment.
+file. For local runs the process inherits your shell; for Airflow task
+containers, add the key on the dashboard's Secrets tab (`hflow ui`) -- it is
+stored owner-only in the user config directory and becomes container
+environment on the next `hflow up`. See [UI.md](../UI.md#secrets).
 
 ## 3. Declare and use the endpoint
 

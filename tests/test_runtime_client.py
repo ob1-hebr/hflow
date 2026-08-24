@@ -18,6 +18,9 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     requests_seen: ClassVar[list[tuple[str, str, dict[str, Any] | None, str | None]]] = []
     healthy: ClassVar[bool] = True
     expire_first_token: ClassVar[bool] = False
+    dag_run_list: ClassVar[list[dict[str, Any]]] = []
+    task_instances: ClassVar[list[dict[str, Any]]] = []
+    dag_task_list: ClassVar[list[dict[str, Any]]] = []
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -66,6 +69,31 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         authorization = self._record(None)
+        if "/xcomEntries/" in self.path:
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            self._respond(200, {"key": self.path.rsplit("/", 1)[-1], "value": "sub-run-7"})
+            return
+        if "/taskInstances" in self.path:
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            self._respond(200, {"task_instances": type(self).task_instances})
+            return
+        if self.path.endswith("/tasks"):
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            tasks = type(self).dag_task_list
+            self._respond(200, {"tasks": tasks, "total_entries": len(tasks)})
+            return
+        if "/dagRuns?" in self.path:
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            self._respond(200, {"dag_runs": type(self).dag_run_list})
+            return
         if "/dagRuns/" in self.path:
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
@@ -105,6 +133,9 @@ def stub_server() -> Iterator[str]:
     _StubAirflowHandler.requests_seen = []
     _StubAirflowHandler.healthy = True
     _StubAirflowHandler.expire_first_token = False
+    _StubAirflowHandler.dag_run_list = []
+    _StubAirflowHandler.task_instances = []
+    _StubAirflowHandler.dag_task_list = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StubAirflowHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -180,3 +211,60 @@ def test_wait_until_healthy_times_out_with_last_status(stub_server: str) -> None
     client = AirflowClient(stub_server, "airflow", "right-password")
     with pytest.raises(TimeoutError, match="scheduler=unhealthy"):
         client.wait_until_healthy(timeout_s=0.3, poll_interval_s=0.1)
+
+
+RUN_ID_WITH_TIMESTAMP = "manual__2026-08-23T04:12:09+00:00"
+QUOTED_RUN_ID = "manual__2026-08-23T04%3A12%3A09%2B00%3A00"
+
+
+def test_dag_runs_list_passes_limit_and_order_by(stub_server: str) -> None:
+    _StubAirflowHandler.dag_run_list = [{"dag_run_id": "manual__1", "state": "success"}]
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    runs = client.dag_runs("pipeline_ingest", limit=7, order_by="-run_after")
+    assert runs == [{"dag_run_id": "manual__1", "state": "success"}]
+    method, path, _, _ = _StubAirflowHandler.requests_seen[-1]
+    assert (method, path) == (
+        "GET",
+        "/api/v2/dags/pipeline_ingest/dagRuns?limit=7&order_by=-run_after",
+    )
+
+
+def test_task_instances_quotes_the_run_id(stub_server: str) -> None:
+    _StubAirflowHandler.task_instances = [{"task_id": "plan", "state": "success"}]
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    instances = client.task_instances("pipeline_ingest", RUN_ID_WITH_TIMESTAMP)
+    assert instances == [{"task_id": "plan", "state": "success"}]
+    _, path, _, _ = _StubAirflowHandler.requests_seen[-1]
+    assert path == (f"/api/v2/dags/pipeline_ingest/dagRuns/{QUOTED_RUN_ID}/taskInstances?limit=100")
+
+
+def test_dag_tasks_lists_task_definitions(stub_server: str) -> None:
+    _StubAirflowHandler.dag_task_list = [
+        {"task_id": "plan", "downstream_task_ids": ["process_batch"], "is_mapped": False}
+    ]
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    tasks = client.dag_tasks("pipeline_sync")
+    assert tasks == _StubAirflowHandler.dag_task_list
+    method, path, _, authorization = _StubAirflowHandler.requests_seen[-1]
+    assert (method, path) == ("GET", "/api/v2/dags/pipeline_sync/tasks")
+    assert authorization is not None and authorization.startswith("Bearer ")
+
+
+def test_xcom_entry_fetches_one_key(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    entry = client.xcom_entry(
+        "pipeline_ingest", RUN_ID_WITH_TIMESTAMP, "trigger_sync", "trigger_run_id"
+    )
+    assert entry == {"key": "trigger_run_id", "value": "sub-run-7"}
+    _, path, _, _ = _StubAirflowHandler.requests_seen[-1]
+    assert path == (
+        f"/api/v2/dags/pipeline_ingest/dagRuns/{QUOTED_RUN_ID}"
+        "/taskInstances/trigger_sync/xcomEntries/trigger_run_id"
+    )
+
+
+def test_dag_run_detail_quotes_the_run_id(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    client.dag_run("pipeline_ingest", RUN_ID_WITH_TIMESTAMP)
+    _, path, _, _ = _StubAirflowHandler.requests_seen[-1]
+    assert path == f"/api/v2/dags/pipeline_ingest/dagRuns/{QUOTED_RUN_ID}"

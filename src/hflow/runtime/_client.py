@@ -17,6 +17,7 @@ import http.client
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -46,6 +47,11 @@ class AirflowHealth:
     def summary(self) -> str:
         parts = [f"{name}={status or 'absent'}" for name, status in sorted(self.components.items())]
         return ", ".join(parts)
+
+
+def _quoted_path_segment(value: str) -> str:
+    """Percent-encode one path segment; run ids carry ``+`` and ``:`` timestamps."""
+    return urllib.parse.quote(value, safe="")
 
 
 class AirflowClient:
@@ -203,13 +209,50 @@ class AirflowClient:
         return self._authenticated("GET", f"/api/v2/dags/{dag_id}")
 
     def dag_run(self, dag_id: str, dag_run_id: str) -> dict[str, Any]:
-        return self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}")
+        return self._authenticated(
+            "GET", f"/api/v2/dags/{dag_id}/dagRuns/{_quoted_path_segment(dag_run_id)}"
+        )
 
-    def dag_runs(self, dag_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        """The DAG's runs (up to ``limit``), as the API returns them."""
-        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns?limit={limit}")
+    def dag_runs(
+        self, dag_id: str, *, limit: int = 100, order_by: str | None = None
+    ) -> list[dict[str, Any]]:
+        """The DAG's runs (up to ``limit``), as the API returns them.
+
+        ``order_by`` is the API's sort field, ``-`` prefix for descending
+        (e.g. ``-run_after`` for newest first).
+        """
+        query = f"limit={limit}"
+        if order_by is not None:
+            query += f"&order_by={urllib.parse.quote(order_by, safe='')}"
+        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns?{query}")
         runs = response.get("dag_runs")
         return runs if isinstance(runs, list) else []
+
+    def dag_tasks(self, dag_id: str) -> list[dict[str, Any]]:
+        """The DAG's task definitions (structure and docs, not per-run state)."""
+        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/tasks")
+        tasks = response.get("tasks")
+        return tasks if isinstance(tasks, list) else []
+
+    def task_instances(
+        self, dag_id: str, dag_run_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """The run's task instances (up to ``limit``), as the API returns them."""
+        response = self._authenticated(
+            "GET",
+            f"/api/v2/dags/{dag_id}/dagRuns/{_quoted_path_segment(dag_run_id)}"
+            f"/taskInstances?limit={limit}",
+        )
+        instances = response.get("task_instances")
+        return instances if isinstance(instances, list) else []
+
+    def xcom_entry(self, dag_id: str, dag_run_id: str, task_id: str, key: str) -> dict[str, Any]:
+        """One XCom entry (404s, as AirflowClientError, when the task pushed none)."""
+        return self._authenticated(
+            "GET",
+            f"/api/v2/dags/{dag_id}/dagRuns/{_quoted_path_segment(dag_run_id)}"
+            f"/taskInstances/{task_id}/xcomEntries/{_quoted_path_segment(key)}",
+        )
 
     def unpause_dag(self, dag_id: str) -> dict[str, Any]:
         return self._authenticated("PATCH", f"/api/v2/dags/{dag_id}", {"is_paused": False})

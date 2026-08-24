@@ -52,6 +52,7 @@ from hflow.steps import (
 from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
+    StorageListing,
     StorageRoot,
     fetch_uri,
     is_bucket_url,
@@ -101,6 +102,7 @@ __all__ = [
     "ResamplePolicy",
     "Stage",
     "StaleEpisode",
+    "StorageListing",
     "StorageRoot",
     "TestReport",
     "TopicInfo",

@@ -88,6 +88,14 @@ x-airflow-common: &airflow-common
     # of repeating into an ephemeral container home. Bucket data roots also
     # put their spool mirrors under this cache, so downloads persist too.
     XDG_CACHE_HOME: /opt/venvs/cache%{bucket_credentials_env}
+  # User secrets (hflow ui, Secrets tab) become container env here; the values
+  # stay in the user's config dir, never in the bundle. Optional so a hand-run
+  # compose still works if the file was deleted. Keys set in `environment:`
+  # above win over the file, so a secret cannot clobber the runtime's own
+  # settings.
+  env_file:
+    - path: '%{user_secrets_env_file}'
+      required: false
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs%{data_volume_line}
